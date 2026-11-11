@@ -68,6 +68,29 @@ class TokenCacheTest(unittest.TestCase):
     def test_missing_file_loads_none(self):
         self.assertIsNone(TokenCache(self.tmp / "nope.json").load())
 
+    def test_save_survives_bind_mount_busy_replace(self):
+        # In Docker the cache file is a single-file bind mount; the mount
+        # point rejects atomic os.replace with EBUSY. Saving must fall back
+        # to an in-place write instead of failing the OAuth callback.
+        path = self.tmp / "tokens.json"
+        path.write_text("{}", encoding="utf-8")
+        cache = TokenCache(path)
+
+        with mock.patch(
+            "glean.token_cache.os.replace",
+            side_effect=OSError(16, "Device or resource busy"),
+        ):
+            cache.save(
+                access_token="at-busy",
+                refresh_token="rt-busy",
+                expires_at=time.time() + 3600,
+                client_id="cid",
+            )
+
+        loaded = TokenCache(path).load()
+        self.assertEqual(loaded["access_token"], "at-busy")
+        self.assertFalse((self.tmp / "tokens.json.tmp").exists(), "tmp file must be cleaned up")
+
     def test_clear_removes_file(self):
         path = self.tmp / "tokens.json"
         TokenCache(path).save(access_token="a", refresh_token="r", expires_at=1, client_id="c")

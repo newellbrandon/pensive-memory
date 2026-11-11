@@ -51,8 +51,20 @@ class TokenCache:
             "client_secret": client_secret,
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        payload = json.dumps(data, indent=2)
+        tmp.write_text(payload, encoding="utf-8")
+        try:
+            os.replace(tmp, self.path)
+        except OSError:
+            # In Docker the cache file is a single-file bind mount: the mount
+            # point cannot be atomically swapped, so os.replace fails with
+            # EBUSY. Fall back to an in-place write — this is a single-user
+            # dev cache, not worth failing the OAuth callback over.
+            self.path.write_text(payload, encoding="utf-8")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         logger.info("Glean token cache updated (%s)", self.path)
 
     def clear(self) -> None:
