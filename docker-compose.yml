@@ -34,6 +34,13 @@ services:
       - GLEAN_SCOPE=${GLEAN_SCOPE:-SEARCH DOCUMENTS ENTITIES MCP}
       - GLEAN_REDIRECT_URI=${GLEAN_REDIRECT_URI:-http://localhost:8000/glean/callback}
       - GLEAN_TOKEN_CACHE=/app/.glean-tokens.json
+      # Atlas Agent Engine long-term memory (agent-engine-sdk-memory). The
+      # default targets the local `agentengine dev up` orchestration engine on
+      # the host; set AGENTIC_MEMORY_* in .env for the hosted platform.
+      - AGENTIC_MEMORY_BASE_URL=${AGENTIC_MEMORY_BASE_URL:-http://host.docker.internal:56423}
+      - AGENTIC_MEMORY_PROJECT_ID=${AGENTIC_MEMORY_PROJECT_ID:-}
+      - AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN=${AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN:-}
+      - AGENTIC_MEMORY_MAX_TOKENS=${AGENTIC_MEMORY_MAX_TOKENS:-2048}
     volumes:
       # Agent lab workspaces live on the host so built apps survive container
       # recreations (path: ${PENSIVE_AGENT_WORKSPACES:-./agent-workspaces}).

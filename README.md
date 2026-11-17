@@ -1,9 +1,9 @@
 # Pensive — LangGraph + MongoDB Demo
 
-A minimal AI agent demo using **LangGraph** for workflow orchestration and **MongoDB** for both:
+A minimal AI agent demo using **LangGraph** for workflow orchestration, **MongoDB** for short-term conversation state, and the **Atlas Agent Engine memory service** (`agent-engine-sdk-memory`) for long-term memory:
 
 - **Short-term memory** — LangGraph checkpoints (`MongoDBSaver`) persist conversation state per thread
-- **Long-term memory** — LangGraph Store (`MongoDBStore`) with semantic vector search across sessions
+- **Long-term memory** — the Atlas Agent Engine memory service: Pensive appends turns with `Memory.record_turn` (the service extracts durable semantic/episodic/taxonomic/procedural facts in the background) and assembles prompt context with `Memory.build_context`
 
 The API is **OpenAI-compatible** so you can connect [OpenWebUI](https://docs.openwebui.com/) or a coding harness (e.g. OpenCode) and chat with the agent. Workflow decisions render as native reasoning **Thought** blocks; the assistant message contains only the final answer.
 
@@ -11,7 +11,7 @@ The API is **OpenAI-compatible** so you can connect [OpenWebUI](https://docs.ope
 
 ### System overview
 
-OpenWebUI or a coding harness sends chat requests to the FastAPI layer, which invokes a compiled LangGraph workflow. MongoDB holds short-term thread state (checkpointer) and long-term facts (store with vector search). On top of the core chat loop, Pensive runs a **server-tool layer** (subagent delegation, project browsing, Glean enterprise search), an **agent lab** (isolated, runnable/rerunnable agents), a **document knowledge base** (contextualized chunk embeddings — agents ground answers in uploaded PDFs via `documents_search` on demand), and a **management console** at `/ui` — with every agent workflow recorded as sortable, metric-bearing run history.
+OpenWebUI or a coding harness sends chat requests to the FastAPI layer, which invokes a compiled LangGraph workflow. MongoDB holds short-term thread state (checkpointer); long-term memory is the **Atlas Agent Engine memory service**, reached through the `agent-engine-sdk-memory` SDK. On top of the core chat loop, Pensive runs a **server-tool layer** (subagent delegation, project browsing, Glean enterprise search), an **agent lab** (isolated, runnable/rerunnable agents), a **document knowledge base** (contextualized chunk embeddings — agents ground answers in uploaded PDFs via `documents_search` on demand), and a **management console** at `/ui` — with every agent workflow recorded as sortable, metric-bearing run history.
 
 Pensive exposes both OpenAI-compatible protocols: **Chat Completions** (`POST /v1/chat/completions`) and the **Responses API** (`POST /v1/responses`). OpenWebUI can be pointed at either connection type.
 
@@ -21,8 +21,7 @@ flowchart TD
   api -->|"ainvoke / astream"| lg[Compiled LangGraph]
   lg --> llm["OpenAI-compatible LLM"]
   lg -.->|"MongoDBSaver · every superstep"| checkpoints["checkpoints<br/>checkpoint_writes"]
-  lg -->|"MongoDBStore · typed namespaces"| memories[("agent_memories")]
-  memories -->|"vector search + iterate-on-merge"| embed["Voyage embeddings"]
+  lg -->|"Memory.record_turn · Memory.build_context (SDK)"| memsvc[("Atlas Agent Engine<br/>memory service")]
 
   lg -.->|"spawn_subagent · digest only"| sub["Isolated subagent<br/>memory agent:sub-* · own workspace"]
   sub -->|"runs the same graph"| lg
@@ -52,15 +51,14 @@ flowchart TD
   analyze -->|"needs_memory"| search["search_long_term_memory<br/>Search Long Term Memory"]
   analyze -->|"skip"| generate["generate_response<br/>Generate Response"]
 
-  search -->|"store.search · 4 types"| agentMem[("agent_memories")]
+  search -->|"Memory.build_context · long-term sources"| memsvc[("Agent Engine<br/>memory service")]
   search --> generate
 
   generate -.->|"OpenAI Responses API"| llmNode[["LLM"]]
   generate -.->|"server-tool loop: spawn_subagent · project_* · glean_*"| serverTools["server tools<br/>budgeted · results fed back"]
   generate --> save["save_memory<br/>Save Memory"]
 
-  save -->|"LLM extract + classify type"| llmNode
-  save -->|"store.put · typed namespace · iterate-on-merge"| agentMem
+  save -->|"Memory.record_turn (user + assistant)"| memsvc
   save --> endNode((END))
 
   agentLab["Agents lab — run_agent<br/>memory agent:&lt;id&gt; scope"] -->|"same graph"| startNode
@@ -80,7 +78,7 @@ flowchart TD
 | Classify Intent | `memory` — personal context | `memory` — recall |
 | Search Long Term Memory | `0 results` | `1 results` |
 | Generate Response | `respond` — no retrieved context | `respond` — uses 1 memory |
-| Save Memory | `saved` → new `agent_memories` doc | `skipped` — no new fact |
+| Save Memory | `saved` — turns recorded | `saved` — turns recorded |
 
 ## Coding-Harness / Persistent-Memory Context
 
@@ -96,9 +94,10 @@ while providing persistent memory for important context:
   `function_call` output items / `response.function_call_arguments.delta` on
   `/v1/responses`), and tool results replay as `function_call_output` items — so
   a coding harness can drive read/write/execute tools through Pensive.
-- **Persistent memory runs on top.** The four-type long-term memory pipeline
-  retrieves and injects remembered context, and persists durable facts — scoped by
-  `user_id` — so they carry across sessions, chats, and workflows.
+- **Persistent memory runs on top.** Every turn is recorded to the Atlas Agent
+  Engine memory service (scoped by `user_id` and session), which extracts durable
+  facts in the background; each turn's prompt is grounded with `build_context`
+  over those facts, so they carry across sessions, chats, and workflows.
 - **Subagent delegation keeps the primary context clean.** Main-context chats are
   offered a server-side `spawn_subagent` tool: the model can delegate a
   self-contained task (research, builds, long tool chains) to an isolated
@@ -137,7 +136,7 @@ canvas, mongo-green accents) and powers five tabs:
 
 | Tab | What you can do |
 | --- | --------------- |
-| **Memories** | Browse and curate the four long-term memory types per user — **Semantic** (user facts and preferences), **Episodic** (session events, decisions, outcomes), **Taxonomic** (domain vocabulary and reusable concepts like corporate policies), **Procedural** (reusable workflows and agent runbooks — skills). Correct a memory and it is **re-embedded automatically** (the write goes through the LangGraph store's vector index); prune to delete. Saves **iterate instead of duplicating**: repeated facts merge into the existing memory (vector-similarity match with lexical fallback, normalized labels), and a **Merge duplicates** button groups semantically similar memories into one complete curated memory per group — near-identical line items collapse (longer version wins) and each group gets an LLM consolidation pass so the result reads as one memory, not a concatenation. The live store went from 101 → 31 memories with the content preserved. |
+| **Memories** | Search a user's memory in the **Atlas Agent Engine memory service** and curate it. Pick a user and type a query — the SDK's ranked search (`Memory.search`) returns the relevant **Semantic** (user facts and preferences), **Episodic** (session events, decisions, outcomes), **Taxonomic** (domain vocabulary and reusable concepts like corporate policies), and **Procedural** (reusable workflows and agent runbooks — skills) memories with scores. **Semantic** facts are editable in place and **re-embedded automatically** on save (`Memory.save_semantic` upserts by label). There is no manual delete or merge: the memory service versions and supersedes memories itself as it extracts them in the background. |
 | **System Prompt** | View and change the assistant persona injected at the top of every main-context request. Persisted in MongoDB; leave empty to restore the built-in default. |
 | **Agents** | Deploy a **test agent** with its own system prompt and tools, then run a task in **complete isolation** — memory is scoped to `agent:<id>` so it can't pollute (or be polluted by) the main Pensive context. The tab is split into three segmented views: **Test Agents** (create form + registry; leave the name blank to **auto-generate** one like `coral-scribe-3621`, and tools empty for the built-in sandboxed set `write_file`, `append_file`, `read_file`, `run_command`, `web_search`, `web_extract`, `documents_search`), **Test Agent History** (every lab-agent run, locked to `test`, sortable), and **Agent Workflows** (every workflow incl. `pensive` subagent runs — aligned Source · Agent · When · Tokens · Tool calls · Runtime columns with clickable filter chips and sort chips). Clicking any row expands the full task, answer, step transcripts, a **Reuse as specialist agent** action, and the workspace files (assets) — a capable subagent (say, a great Glean researcher) can be promoted into a permanent, rerunnable agent with its own memory scope. **Edit any agent** (Edit button loads its name/prompt/tools back into the form), and open **Runs & artifacts** on a card to review past runs — each run shows a **step-by-step transcript** (model response, decisions, and every executed tool call with full arguments and results), a one-click **Run again** button, and a **workspace file browser** (list + content preview via `GET /agents/{id}/workspace`). |
 | **Documents** | Build a **queryable knowledge base** from uploaded files (PDF / txt / md) using **contextualized chunk embeddings** (`voyage-context-4`) — extract text (pypdf), split into bounded segments, and embed each chunk **in the context of its full document** (server-side auto-chunking, 512-token chunks, char-budgeted batches to respect the API's per-request token cap). The library lists every document with its status (`ingesting → ready | failed`), pages, chunk count, tokens, and model — plus **Chunk preview** (text per chunk), **Re-embed** (retry a failed ingest), and **Delete** (drops chunks + the stored original). A **semantic search** box embeds the query (`input_type=query`) and returns the top-k chunks with scores, optionally restricted to one document. The **`documents_search` tool** then makes the corpus available to every agent on demand — it is never injected into prompts, so queries that don't need it pay nothing. |
@@ -145,7 +144,8 @@ canvas, mongo-green accents) and powers five tabs:
 
 **Agent tool execution.** Agent tool calls are actually *executed*: file and shell tools run inside a per-agent workspace directory (`./agent-workspaces/<agent_id>/`, mounted into the container so built apps survive restarts), results are fed back to the model in a loop (up to 24 steps), and transient upstream failures or broken tool-call payloads are retried automatically. Every tool failure becomes a model-visible `[error]` result — never a crash — with actionable guidance (invalid JSON is reported with reissue instructions; large files should be built with `append_file`). Completed runs are persisted (`pensive_agent_runs`) with their answer, decisions, and executed tool calls so past agents can be reviewed and re-run — the counts **aggregate every executed call, server-tool executions included** (glean/spawn/project work inside the generate loop is folded into the step transcripts), and legacy runs derive their call/step totals from the stored transcripts. The workflow list is **retained to at most 1500 runs and none older than 30 days** — whichever limit is hit first, enforced after every recorded run.
 
-Backing REST API (all under `/api/admin`): `memory-types`, `memories` (GET/PUT/DELETE),
+Backing REST API (all under `/api/admin`): `memory-types`, `memories` (`GET` search with
+`?user_id=&query=&mem_type=` + `PUT /memories/{mem_type}/{label}`),
 `system-prompt` (GET/PUT), `agents` (CRUD + `POST /agents/{id}/run` + `GET /agents/{id}/runs`
 + `GET /agents/{id}/workspace` + `GET /agents/{id}/workspace/file?path=…`), `runs`
 (global workflow feed, tagged `pensive` vs `test`, filterable via
@@ -182,14 +182,13 @@ ground answers in — on demand, never ambient:
    when the corpus grows). Optionally restrict to one document.
 
 Every agent's toolset includes **`documents_search(query, k?, document?)`** — a
-**memory-first** knowledge lookup: Pensive's long-term memory is swept *before*
-the corpus — the run's own namespace, the console user's (`default`), and
-every other agent/subagent namespace. When a confident match exists
-(similarity ≥ 0.80 — this information was already retrieved and stored, by
-this agent, you, or another agent) the memory facts answer the query, the
-tool says so, and the corpus is **not** queried at all. Only weak or empty
-memory matches fall through to the corpus, which costs one query embedding +
-scan.
+**memory-first** knowledge lookup: Pensive's long-term memory is searched
+*before* the corpus via the Agent Engine SDK (`Memory.search`) — the run's own
+scope and the console user's (`default`), merged by score. When a confident
+match exists (similarity ≥ 0.80 — this information was already retrieved and
+stored, by this agent or you) the memory facts answer the query, the tool says
+so, and the corpus is **not** queried at all. Only weak or empty memory matches
+fall through to the corpus, which costs one query embedding + scan.
 The corpus is never injected into prompts automatically. When a run did
 retrieve chunks, its answer ends with a deterministic one-line **Sources**
 suffix — just the name(s) of the ingested resource(s), deduped and best-first
@@ -197,11 +196,12 @@ suffix — just the name(s) of the ingested resource(s), deduped and best-first
 tool digests stored in the run transcript, so the citation sits at the end and
 the answer text stays clean to copy-paste.
 
-## Long-Term Memory (Four Types)
+## Long-Term Memory (Agent Engine)
 
-Pensive's long-term memory is organized into the same four types used by the
-Atlas Agent Engine memory server, all stored in the `agent_memories` collection
-under per-type namespaces on the LangGraph MongoDB Store:
+Pensive's long-term memory **is** the [Atlas Agent Engine memory
+service](https://www.mongodb.com/docs/agentengine/sdk/python/packages/agent-engine-sdk-memory/),
+reached through the official `agent-engine-sdk-memory` SDK. The service distils
+conversations into the same four shapes it always uses:
 
 | Type        | Meaning                                              |
 | ----------- | ---------------------------------------------------- |
@@ -210,30 +210,51 @@ under per-type namespaces on the LangGraph MongoDB Store:
 | `taxonomic` | Categories or domain knowledge the user relies on    |
 | `procedural`| How the user does things (steps, output preferences) |
 
-The **Memories** tab in the Pensive Console (`/ui`) is where you browse and curate those types for a user. Edits save to MongoDB and are re-embedded automatically; **Merge duplicates** collapses semantically similar memories into one curated record.
+The adapter (`memory/agent_engine.py`) is the only seam that talks to the
+service; everything else calls it:
 
-![Long-term memory in the Pensive Console: four types, per-user counts, and edit or prune](console_long_term_memory.png)
+1. **Intent planning** (`analyze_intent`, in `memory/memories.py`) — an LLM turns
+   the latest message into a search `query`, a `needs_memory` flag, and a
+   `research` classification that drives deterministic subagent delegation.
+2. **Context assembly** (`search_long_term_memory`) — `Memory.build_context`
+   retrieves over the long-term sources (`semantic`, `episodic`, `taxonomic`,
+   `procedural`), ranks and de-duplicates across them, trims to a token budget,
+   and returns the context. **STM is deliberately excluded**: the harness
+   transcript already carries the current conversation, so re-injecting recent
+   turns would duplicate it.
+3. **Generation** — the memory context is folded into one injected system block
+   (background context, never a fake user/assistant turn) and personalized into
+   the reply.
+4. **Write-back** (`save_memory`) — `Memory.record_turn` appends the user and
+   assistant turns (idempotency-keyed, so a retried request never double-records).
+   The service extracts durable facts from those turns **in the background**, so
+   Pensive no longer runs its own extraction, merging, or dedup pass.
 
-The pipeline (implemented in `memory/memories.py`) works like this:
+Because extraction is asynchronous, a fact learned in one conversation appears a
+little later than the turn that taught it — recent turns are covered by the
+harness transcript in the meantime.
 
-1. **Intent planning** (`analyze_intent`) — an LLM turns the latest message into a
-   semantic search `query` and a `needs_memory` flag.
-2. **Retrieval** (`search_long_term_memory`) — vector-searches all four types,
-   drops superseded/empty facts, and reranks with Voyage (`rerank-2.5-lite`),
-   falling back to vector-score order when `VOYAGE_API_KEY` is unset.
-3. **Generation** — the dated, newest-first memory block is injected as a separate
-   system message and personalized into the reply.
-4. **Write-back** (`save_memory`) — the LLM extracts durable facts and classifies
-   each into one of the four types. Saves **iterate instead of duplicating**:
-   labels are normalized (casing/whitespace collapse), and before inserting, a
-   fact that vector-matches an existing same-type memory (≥ 0.85 similarity,
-   lexical fallback) is **merged into it** — content combined, canonical label
-   and earliest `recorded_at` kept — instead of stored as a new record. The
-   console's **Merge duplicates** cleanup groups semantically similar memories
-   per type and curates each group into ONE memory: near-identical lines
-   collapse to their longer version, then an LLM consolidation pass rewrites
-   the fragments as a single flowing memory (best-effort, heuristic fallback).
-   Enable rerank by setting `VOYAGE_API_KEY` in `.env`.
+### Configuration
+
+Point the SDK at a backend with `AGENTIC_MEMORY_*` (see `env.example`):
+
+- **Local dev** (`agentengine dev up`): `AGENTIC_MEMORY_BASE_URL` only — e.g.
+  `http://localhost:56423` on the host, or `http://host.docker.internal:56423`
+  from the container (the compose default).
+- **Hosted platform**: `AGENTIC_MEMORY_PROJECT_ID` +
+  `AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN`.
+
+With none set — or when the backend is unreachable — memory degrades to a no-op:
+a chat turn never fails because memory is down.
+
+### Console
+
+The **Memories** tab searches a user's memory (`Memory.search`) and edits
+semantic facts in place (`Memory.save_semantic`, upsert by label — re-embedded
+automatically). There is no manual delete or merge: the service versions and
+supersedes memories itself.
+
+![Long-term memory in the Pensive Console: search results across the four types](console_long_term_memory.png)
 
 ### Memory pays off on repeat work (tokens, tools, runtime)
 
@@ -258,7 +279,7 @@ Sort the workflow table by **Fewest tokens** or **Fastest** to surface agents wo
 - OpenAI-compatible LLM endpoint. Pensive speaks the OpenAI **Responses API** (`LLM_URI`, `LLM_KEY`, `LLM_MODEL`) so it works correctly with reasoning models; the final answer is read from the response's `output` message items and any model reasoning/"thinking" is discarded. Models that only speak Chat Completions (the gateway answers `model_not_found` on `/responses`, e.g. `deepseek-*`, `glm-*`) are retried automatically against `/chat/completions` with a translated payload.
 - Voyage embeddings via MongoDB AI (`LLM_EMBEDDING_KEY`) — custom `VoyageEmbeddings` client in `utils/llm.py`
 - Document ingestion uses the same key against the **contextualized embeddings** endpoint (`CONTEXT_EMBEDDING_URI`, default `https://ai.mongodb.com/v1/contextualizedembeddings`, model `CONTEXT_EMBEDDING_MODEL`, default `voyage-context-4`) — the Files tab uploads land here with server-side auto-chunking
-- Optional memory rerank — set `VOYAGE_API_KEY` to enable Voyage reranking of retrieved memories; otherwise Pensive ranks by vector similarity.
+- An **Atlas Agent Engine memory** backend for long-term memory (`AGENTIC_MEMORY_BASE_URL`, or `AGENTIC_MEMORY_PROJECT_ID` + `AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN`). Optional: with none set, Pensive runs without long-term memory.
 
 ## Setup
 
@@ -275,31 +296,6 @@ cp env.example .env
 python3.13 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-1. Create the vector search index (run once):
-
-```bash
-python scripts/setup_memory_index.py
-```
-
-Index definition (for manual creation in Atlas UI if the script fails):
-
-```json
-{
-  "fields": [
-    {
-      "type": "vector",
-      "path": "embedding",
-      "numDimensions": 1024,
-      "similarity": "cosine"
-    },
-    {
-      "type": "filter",
-      "path": "user_id"
-    }
-  ]
-}
 ```
 
 1. Start the API:
@@ -365,7 +361,7 @@ LangSmith tracing is optional and controlled by environment variables in `.env`:
 | `LANGSMITH_ENDPOINT` | API endpoint (default: `https://api.smith.langchain.com`) |
 | `USER_ID` | Identity pin — when set, every client shares this memory scope (overrides forwarded OpenWebUI user headers and body `user`); leave empty for per-user memory |
 
-When `LANGSMITH_TRACING=true` and a valid `LANGSMITH_API_KEY` is set, traces appear at [smith.langchain.com](https://smith.langchain.com) under the configured project. Each chat request produces a top-level run with tags `pensive` and `chat`, `metadata.user_id` from the OpenWebUI user, plus `chat_id` / `session_id` when forwarded, including nested LangGraph node spans, OpenAI Responses API LLM calls, and `voyage_embed` embedding spans during memory search.
+When `LANGSMITH_TRACING=true` and a valid `LANGSMITH_API_KEY` is set, traces appear at [smith.langchain.com](https://smith.langchain.com) under the configured project. Each chat request produces a top-level run with tags `pensive` and `chat`, `metadata.user_id` from the OpenWebUI user, plus `chat_id` / `session_id` when forwarded, including nested LangGraph node spans and OpenAI Responses API LLM calls (memory retrieval happens inside the Agent Engine service, outside the trace).
 
 If tracing is disabled or the API key is missing, the API starts normally without reporting to LangSmith.
 
@@ -392,7 +388,7 @@ docker compose up -d --build
 curl http://localhost:8000/health
 ```
 
-Stop with `docker compose down`. Vector index setup (`scripts/setup_memory_index.py`) runs on the host against your MongoDB, not inside the container.
+Stop with `docker compose down`. Long-term memory lives in the Agent Engine memory service, not MongoDB, so there is no vector index to create for it (document embeddings keep their own `document_chunks` index).
 
 ## OpenWebUI Configuration
 
@@ -447,9 +443,10 @@ A single Session 1 message on a fresh database produces:
 
 | Collection          | Documents | Role                                                   |
 | ------------------- | --------- | ------------------------------------------------------ |
-| `agent_memories`    | 1         | Long-term fact with embedding (LangGraph Store)        |
 | `checkpoints`       | 6         | Thread-scoped graph state snapshots (~1 per superstep) |
 | `checkpoint_writes` | 18        | State-channel writes across those steps                |
+
+(Long-term facts live in the Agent Engine memory service, not in MongoDB.)
 
 
 LangGraph persists checkpoint state at each graph superstep, not just the four workflow nodes visible in OpenWebUI — so **6 checkpoints and ~18 writes per message is expected**, not a leak.
@@ -465,11 +462,11 @@ Workflow:
 - **Classify Intent** → `memory` — query references personal context or recall
 - **Search Long Term Memory** → `1 results` — found the name saved in Session 1
 - **Generate Response** → `respond` — answer generated using 1 retrieved memory
-- **Save Memory** → `skipped` — no new durable fact to save
+- **Save Memory** → `saved` — this turn's messages recorded to the memory service
 
 **Answer:** "Yes, Brandon! Good to hear from you again. How can I help?"
 
-Session 2 demonstrates **long-term memory**: the fact persisted in MongoDB (`agent_memories`) and was retrieved via semantic search in a separate OpenWebUI chat. Session 2 adds another checkpoint thread (~6 checkpoints, ~18 writes) but does not add a new `agent_memories` document when save is skipped.
+Session 2 demonstrates **long-term memory**: the fact was recorded to the Agent Engine memory service in Session 1, extracted in the background, and retrieved via `Memory.build_context` in a separate OpenWebUI chat. Session 2 adds another checkpoint thread (~6 checkpoints, ~18 writes).
 
 ## API Endpoints
 
@@ -511,7 +508,8 @@ pensive/
 │   ├── executor.py         # sandboxed agent tools (files, shell, web, projects)
 │   └── service.py          # agent registry, run loop + metrics, memory curation, run history
 ├── memory/
-│   └── memories.py         # four-type memory pipeline (iterate-on-merge + curated merge)
+│   ├── agent_engine.py     # Atlas Agent Engine memory adapter (agent-engine-sdk-memory)
+│   └── memories.py         # per-turn intent planning (query + research classification)
 ├── glean/
 │   ├── oauth.py            # MCP dynamic-client OAuth2 (discovery, DCR, PKCE, refresh)
 │   ├── client.py           # MCP client wrapper (one session per operation)
@@ -523,14 +521,13 @@ pensive/
 │   ├── glean_routes.py     # /api/admin/glean + OAuth callback at /glean/callback
 │   └── models.py           # request/response schemas
 ├── persistence/
-│   └── mongo.py            # MongoDBSaver + MongoDBStore
+│   └── mongo.py            # MongoDBSaver (short-term thread state)
 ├── static/                 # Pensive Console UI (MongoDB theme)
-├── tests/                  # 176 tests: graph, memories, glean OAuth/client, agents, API
+├── tests/                  # graph, Agent Engine memory adapter, glean OAuth/client, agents, API
 ├── utils/
 │   └── llm.py              # OpenAI Responses API (+ usage) + Voyage embeddings clients
 ├── agent-workspaces/       # per-agent sandboxes (gitignored, host-mounted)
 └── scripts/
-    ├── setup_memory_index.py
     └── glean_auth.py       # one-shot host-side Glean OAuth (loopback + fragment relay)
 ```
 

@@ -27,12 +27,12 @@ def _state(offer=True, tools=None):
         "prompt_messages": [HumanMessage(content="delegate the research")],
         "decisions": [],
         "user_id": "u1",
+        "session_id": "thread-1",
         "intent": "",
         "retrieved_memories": [],
         "response": "",
         "memory_needed": False,
         "memory_query": "",
-        "memory_candidates": [],
         "memory_context": [],
         "tools": tools or [],
         "tool_choice": None,
@@ -508,3 +508,83 @@ class ModelWindowTest(SpawnSubagentTest):
         # Identical context -> identical hash (so "sticking" is visible in logs)
         self.assertEqual(summary, nodes._context_summary(list(msgs)))
         self.assertNotEqual(summary, nodes._context_summary([HumanMessage(content="different")]))
+
+
+class AgentEngineMemoryNodeTest(unittest.TestCase):
+    """The memory nodes talk to the Agent Engine memory service through the
+    adapter: reads assemble context with ``build_context``, writes append turns
+    with ``record_turn`` (the server extracts durable facts in the background)."""
+
+    def setUp(self):
+        self.emit = mock.patch("agent.nodes._emit_decision").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_search_long_term_memory_uses_build_context(self):
+        state = _state()
+        state["memory_query"] = "what does the user prefer"
+        context = [{"role": "system", "content": "Brandon prefers Glean."}]
+        with mock.patch.object(
+            nodes.agent_engine, "build_context", return_value=context
+        ) as build:
+            result = _run(nodes.search_long_term_memory(state, None))
+        self.assertEqual(result["memory_context"], context)
+        self.assertEqual(result["retrieved_memories"], context)
+        args = build.call_args.args
+        self.assertEqual(args[:2], ("u1", "thread-1"))
+        self.assertEqual(args[2], "what does the user prefer")
+
+    def test_search_skips_when_no_query(self):
+        state = _state()
+        state["memory_query"] = ""
+        with mock.patch.object(nodes.agent_engine, "build_context") as build:
+            result = _run(nodes.search_long_term_memory(state, None))
+        build.assert_not_called()
+        self.assertEqual(result["memory_context"], [])
+
+    def test_save_memory_records_user_and_assistant_turns(self):
+        state = _state()
+        state["response"] = "Done."
+        with mock.patch.object(
+            nodes.agent_engine, "record_turn", return_value=True
+        ) as rec:
+            result = _run(nodes.save_memory(state, None))
+        calls = [(c.args[2], c.args[3]) for c in rec.call_args_list]
+        self.assertEqual(
+            calls, [("user", "delegate the research"), ("assistant", "Done.")]
+        )
+        self.assertEqual(rec.call_args_list[0].args[:2], ("u1", "thread-1"))
+        emitted = [(c.args[0], c.args[1]) for c in self.emit.call_args_list]
+        self.assertIn(("save_memory", "saved"), emitted)
+
+    def test_save_memory_reports_skipped_when_nothing_recorded(self):
+        state = _state()
+        state["response"] = ""
+        with mock.patch.object(
+            nodes.agent_engine, "record_turn", return_value=False
+        ):
+            result = _run(nodes.save_memory(state, None))
+        emitted = [(c.args[0], c.args[1]) for c in self.emit.call_args_list]
+        self.assertIn(("save_memory", "skipped"), emitted)
+
+    def test_generate_injects_memory_context_as_messages(self):
+        state = _state(offer=False)
+        state["memory_context"] = [{"role": "system", "content": "Brandon prefers Glean."}]
+        with mock.patch("agent.nodes.get_responses_client") as get_client:
+            get_client.return_value = _FakeClient([{"text": "ok"}])
+            _run(nodes.generate_response(state))
+        sent = get_client.return_value.calls[0]["messages"]
+        self.assertTrue(
+            any(
+                isinstance(m, SystemMessage) and "Brandon prefers Glean." in m.content
+                for m in sent
+            )
+        )
+
+    def test_generate_without_memory_injects_nothing_extra(self):
+        state = _state(offer=False)
+        state["memory_context"] = []
+        with mock.patch("agent.nodes.get_responses_client") as get_client:
+            get_client.return_value = _FakeClient([{"text": "ok"}])
+            _run(nodes.generate_response(state))
+        sent = get_client.return_value.calls[0]["messages"]
+        self.assertEqual([m for m in sent if isinstance(m, SystemMessage)], [])

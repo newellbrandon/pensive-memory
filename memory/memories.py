@@ -1,28 +1,17 @@
-"""Four-type long-term memory (semantic / episodic / taxonomic / procedural).
+"""Intent planning for long-term memory.
 
-The pipeline is adapted to Pensive as follows:
-
-- Writes go to per-type namespaces on the LangGraph MongoDBStore:
-  ``("users", <user_id>, "memories", <type>)``. Keys are derived from
-  ``<type>:<label>`` so re-saving the same label supersedes the prior value
-  (last-write-wins), so the newest saved fact wins.
-- Retrieval vector-searches whichever source types are requested, drops
-  superseded/empty facts, then reranks (Voyage, with a vector-similarity
-  fallback) and orders newest-first for the prompt context block.
-- Intent planning and typed extraction both use Pensive's OpenAI Responses
-  client (structured output is emulated by asking for JSON).
+Storage and retrieval are the Atlas Agent Engine memory service now (see
+``memory/agent_engine.py``). What remains here is the one thing the service
+does not do: deciding, per turn, whether memory is relevant, what to search
+for, and whether the turn is a research task that should be delegated.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import os
 import re
-from datetime import datetime, timezone
 from typing import Any, Sequence
 
-import httpx
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
@@ -30,13 +19,9 @@ from utils.llm import get_responses_client
 
 logger = logging.getLogger(__name__)
 
+# The four long-term memory types the Agent Engine memory server extracts.
 MEMORY_TYPES = ("semantic", "episodic", "taxonomic", "procedural")
 ALL_TYPES = list(MEMORY_TYPES)
-SEARCH_TOP_K = 8
-RERANK_TOP_K = 5
-
-DEFAULT_VOYAGE_RERANK_URL = "https://ai.mongodb.com/v1/rerank"
-VOYAGE_RERANK_MODEL = "rerank-2.5-lite"
 
 INTENT_PROMPT = (
     "You plan long-term memory lookups for an assistant. Read the latest user "
@@ -55,111 +40,7 @@ INTENT_PROMPT = (
     'Return JSON only: {"intent": str, "needs_memory": bool, "query": str, "rationale": str}.'
 )
 
-EXTRACT_PROMPT = (
-    "Extract durable long-term memories from the user's message and classify each into "
-    "one of these types:\n"
-    "- semantic: stable facts and preferences about the user\n"
-    "- episodic: a specific past event or interaction, no longer true-as-fact but recallable\n"
-    "- taxonomic: categories or domain knowledge the user relies on\n"
-    "- procedural: how the user does things (steps, preferences for output)\n"
-    "Save only explicit, lasting information. Do not save questions or transient chit-chat. "
-    'Return JSON only: {"memories": [{"type": "semantic|episodic|taxonomic|procedural", '
-    '"text": str, "label": str}]}. An empty list means nothing durable was shared.'
-)
-
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-_JSON_ARRAY = re.compile(r"\[.*\]", re.DOTALL)
-
-# Same-fact detection for memory iteration & cleanup: a peer is "the same
-# memory" when vector similarity clears MEMORY_MERGE_SCORE or, when no
-# embeddings are available, token overlap clears MEMORY_MERGE_OVERLAP.
-MEMORY_MERGE_SCORE = 0.85
-MEMORY_MERGE_OVERLAP = 0.6
-# Within a merged memory, two lines that overlap this much are THE SAME
-# sentence — keep the longer/fuller version instead of listing both.
-MEMORY_LINE_MERGE_OVERLAP = 0.75
-_WORD_SPLIT = re.compile(r"[^a-z0-9']+", re.I)
-
-
-def normalize_label(label: str) -> str:
-    """Canonical form for memory labels so label drift ("Professional
-    focus" vs "professional focus") maps to ONE key instead of duplicates."""
-    return _WORD_SPLIT.sub(" ", str(label or "")).strip().lower()
-
-
-def _token_containment(a: str, b: str) -> float:
-    """Fraction of the shorter text's tokens present in the longer one —
-    the right measure for 'same sentence with a longer tail' variants."""
-    tokens_a = {t for t in _WORD_SPLIT.split(str(a).lower()) if t}
-    tokens_b = {t for t in _WORD_SPLIT.split(str(b).lower()) if t}
-    shorter = min(len(tokens_a), len(tokens_b))
-    if not shorter:
-        return 0.0
-    return len(tokens_a & tokens_b) / shorter
-
-
-def merge_texts(existing: str, new: str) -> str:
-    """Combine two memory texts into ONE curated memory: exact and
-    near-identical lines collapse to their longer/fuller version (token
-    containment >= MEMORY_LINE_MERGE_OVERLAP), so a repetition with a longer
-    tail doesn't produce duplicate line items; distinct facts are always
-    kept; source order is preserved."""
-    lines = [l.strip() for l in str(existing or "").splitlines() + str(new or "").splitlines() if l.strip()]
-    if not lines:
-        return ""
-    # Longest-first so a shorter variant gets dropped in favor of its fuller
-    # version; then restore original order (first occurrence wins).
-    kept: list[str] = []
-    for line in sorted(set(lines), key=lambda l: (-len(l), l)):
-        if any(_token_containment(line, k) >= MEMORY_LINE_MERGE_OVERLAP for k in kept):
-            continue
-        kept.append(line)
-    order: dict[str, int] = {}
-    for i, line in enumerate(lines):
-        order.setdefault(line, i)
-    kept.sort(key=lambda line: order[line])
-    return "\n".join(kept)
-
-
-CONSOLIDATE_PROMPT = (
-    "Merge the following memory fragments — they all describe the same concept — "
-    "into ONE concise, complete memory. Keep every distinct fact, drop repeated "
-    "or overlapping wording, do not invent new facts, do not use lists or bullets. "
-    "Reply with the merged memory text only.\n\nFRAGMENTS:\n{texts}"
-)
-
-
-async def consolidate_memories(client: Any, texts: list[str]) -> str:
-    """LLM polish: fold near-duplicate memory fragments into one flowing
-    curated memory. Returns "" on failure so callers fall back to the
-    heuristic merge result."""
-    fragments = [f"- {t.strip()}" for t in texts if str(t).strip()]
-    if not fragments:
-        return ""
-    try:
-        raw = await client.agenerate(
-            [
-                SystemMessage(content=CONSOLIDATE_PROMPT.format(texts="\n".join(fragments))),
-                HumanMessage(content="Merge."),
-            ]
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Memory consolidation failed")
-        return ""
-    text = str(raw or "").strip()
-    if len(text) < 20:
-        return ""
-    return text
-
-
-def lexical_similarity(a: str, b: str) -> float:
-    """Jaccard overlap of normalized tokens — the no-embedding fallback for
-    same-fact detection."""
-    tokens_a = {t for t in _WORD_SPLIT.split(str(a).lower()) if t}
-    tokens_b = {t for t in _WORD_SPLIT.split(str(b).lower()) if t}
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
 class MemoryPlan(BaseModel):
@@ -189,8 +70,6 @@ def _extract_json(text: str, pattern) -> Any | None:
         logger.warning("Could not parse JSON from LLM reply: %s", exc)
         return None
 
-
-# --- intent planning ---------------------------------------------------------
 
 def _intent_context(messages: Sequence[AnyMessage]) -> list[AnyMessage]:
     """Text-only context for intent analysis: the latest user message and the
@@ -245,297 +124,6 @@ async def plan_memory_query(client: Any, messages: Sequence[AnyMessage]) -> Memo
     )
 
 
-# --- storage -------------------------------------------------------------
-
-def namespace(user_id: str, mem_type: str) -> tuple[str, ...]:
-    return ("users", user_id, "memories", mem_type)
-
-
-def _recorded_at(value: dict) -> str | None:
-    ts = value.get("recorded_at") or value.get("updated_at")
-    return str(ts) if ts else None
-
-
-def _similar_existing(store: Any, user_id: str, mem_type: str, text: str) -> tuple[str, dict] | None:
-    """Find an existing memory that IS the same fact (vector sim or lexical
-    fallback). Returns its (key, value) so saves can iterate instead of
-    duplicating."""
-    if store is None:
-        return None
-    try:
-        results = store.search(namespace(user_id, mem_type), query=text, limit=8) or []
-    except Exception as exc:
-        logger.warning("Memory similarity search failed (%s: %s)", type(exc).__name__, exc)
-        return None
-    for item in results:
-        key = getattr(item, "key", None) or (item.get("key") if isinstance(item, dict) else None)
-        value = getattr(item, "value", None) or (item.get("value") if isinstance(item, dict) else {})
-        if not key or not isinstance(value, dict):
-            continue
-        if value.get("superseded_by_version_id") or value.get("superseded_by_snapshot"):
-            continue
-        if str(value.get("user_id") or "") != user_id:
-            continue
-        if str(value.get("type") or mem_type) != mem_type:
-            continue
-        score = getattr(item, "score", None)
-        if score is None and isinstance(item, dict):
-            score = item.get("score")
-        if score is not None:
-            if float(score) >= MEMORY_MERGE_SCORE:
-                return key, value
-            continue
-        if lexical_similarity(text, str(value.get("content") or "")) >= MEMORY_MERGE_OVERLAP:
-            return key, value
-    return None
-
-
-def save_memories(store: Any, user_id: str, memories: list[dict]) -> int:
-    """Persist typed memories; same (type,label) supersedes (overwrites) prior
-    value, and a near-duplicate fact (same type, high similarity) is merged
-    INTO the existing memory instead of stored again — label drift converges
-    on one record rather than piling up copies."""
-    if store is None:
-        return 0
-    saved = 0
-    for item in memories:
-        mem_type = str(item.get("type") or "").strip().lower()
-        if mem_type not in MEMORY_TYPES:
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text:
-            continue
-        fallback_label = f"{mem_type}_{hashlib.sha256(text.encode()).hexdigest()[:8]}"
-        label = normalize_label(str(item.get("label") or fallback_label))
-        now = datetime.now(timezone.utc).isoformat()
-
-        peer = _similar_existing(store, user_id, mem_type, text)
-        if peer is not None:
-            peer_key, peer_value = peer
-            try:
-                merged_value = dict(peer_value)
-                merged_value.update(
-                    {
-                        "content": merge_texts(str(peer_value.get("content") or ""), text),
-                        # Keep the anchored label + earliest recorded_at; stamp
-                        # the iteration time so freshness is visible.
-                        "label": str(peer_value.get("label") or label),
-                        "updated_at": now,
-                    }
-                )
-                store.put(namespace(user_id, mem_type), peer_key, merged_value)
-                saved += 1
-            except Exception as exc:
-                logger.warning("Memory merge failed (%s: %s)", type(exc).__name__, exc)
-            continue
-
-        key = hashlib.sha256(f"{mem_type}:{label}".encode()).hexdigest()[:16]
-        try:
-            store.put(
-                namespace(user_id, mem_type),
-                key,
-                {
-                    "content": text,
-                    "user_id": user_id,
-                    "type": mem_type,
-                    "label": label,
-                    "recorded_at": now,
-                    "updated_at": now,
-                },
-            )
-            saved += 1
-        except Exception as exc:
-            logger.warning("Memory save failed (%s: %s)", type(exc).__name__, exc)
-    return saved
-
-
-async def extract_memories(client: Any, query: str, user_id: str) -> list[dict]:
-    """Ask the LLM to extract and classify durable memories from the user message."""
-    try:
-        raw = await client.agenerate(
-            [SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=query)]
-        )
-        data = _extract_json(str(raw), _JSON_OBJECT)
-        memories = data.get("memories") if isinstance(data, dict) else None
-        if not isinstance(memories, list):
-            return []
-        cleaned = []
-        for item in memories:
-            if not isinstance(item, dict):
-                continue
-            mem_type = str(item.get("type") or "").strip().lower()
-            if mem_type in MEMORY_TYPES and str(item.get("text") or "").strip():
-                cleaned.append(
-                    {"type": mem_type, "text": str(item["text"]).strip(), "label": str(item.get("label") or "")}
-                )
-        return cleaned
-    except Exception:
-        logger.exception("Memory extraction failed")
-        return []
-
-
-async def extract_and_save(client: Any, store: Any, query: str, user_id: str) -> int:
-    """Extract typed memories from the latest user message and persist them."""
-    memories = await extract_memories(client, query, user_id)
-    return save_memories(store, user_id, memories)
-
-
-# --- retrieval -----------------------------------------------------------
-
-def _search_source(store: Any, user_id: str, mem_type: str, query: str) -> list[dict]:
-    if store is None or not query:
-        return []
-    try:
-        results = store.search(namespace(user_id, mem_type), query=query, limit=SEARCH_TOP_K)
-    except Exception as exc:
-        logger.warning(
-            "Memory search failed for %s (%s: %s)", mem_type, type(exc).__name__, exc
-        )
-        return []
-    hits = []
-    for item in results or []:
-        value = getattr(item, "value", None) or {}
-        if value.get("superseded_by_version_id") or value.get("superseded_by_snapshot"):
-            continue
-        text = str(value.get("content") or "")
-        if not text:
-            continue
-        hits.append(
-            {
-                "text": text,
-                "source": value.get("type") or mem_type,
-                "similarity_score": getattr(item, "score", None),
-                "timestamp": _recorded_at(value),
-            }
-        )
-    return hits
-
-
-def retrieve(
-    store: Any,
-    query: str,
-    user_id: str,
-    sources: Sequence[str] = ALL_TYPES,
-) -> list[dict]:
-    """Vector-search the requested memory types; return [] when memory is unavailable."""
-    if store is None or not query or not user_id:
-        return []
-    candidates: list[dict] = []
-    for mem_type in sources:
-        if mem_type in MEMORY_TYPES:
-            candidates.extend(_search_source(store, user_id, mem_type, query))
-    return candidates
-
-
-def _by_similarity(candidates: list[dict], top_k: int) -> list[dict]:
-    ordered = sorted(
-        candidates,
-        key=lambda c: c["similarity_score"] if c["similarity_score"] is not None else float("-inf"),
-        reverse=True,
-    )
-    return [
-        {**c, "relevance_score": None, "rank": rank}
-        for rank, c in enumerate(ordered[:top_k], start=1)
-    ]
-
-
-def rerank(
-    query: str,
-    candidates: list[dict],
-    top_k: int = RERANK_TOP_K,
-    *,
-    transport: httpx.BaseTransport | None = None,
-) -> list[dict]:
-    """Rerank candidates with Voyage; fall back to vector similarity on failure/missing key."""
-    if not candidates:
-        return []
-    api_key = os.environ.get("VOYAGE_API_KEY", "")
-    if not api_key:
-        logger.warning("VOYAGE_API_KEY is missing; ranking memory by vector similarity")
-        return _by_similarity(candidates, top_k)
-    try:
-        with httpx.Client(timeout=10.0, transport=transport) as http:
-            response = http.post(
-                os.environ.get("VOYAGE_RERANK_URL") or DEFAULT_VOYAGE_RERANK_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "query": query,
-                    "documents": [c["text"] for c in candidates],
-                    "model": VOYAGE_RERANK_MODEL,
-                    "top_k": top_k,
-                },
-            )
-            response.raise_for_status()
-            results = response.json()["data"]
-        return [
-            {
-                **candidates[item["index"]],
-                "relevance_score": float(item["relevance_score"]),
-                "rank": rank,
-            }
-            for rank, item in enumerate(results[:top_k], start=1)
-        ]
-    except Exception as exc:
-        logger.warning(
-            "Voyage rerank failed (%s: %s); ranking memory by vector similarity",
-            type(exc).__name__,
-            exc,
-        )
-        return _by_similarity(candidates, top_k)
-
-
-# --- context -------------------------------------------------------------
-
-def chronological(hits: list[dict]) -> list[dict]:
-    """Newest first; memories without a known time go last."""
-    return sorted(hits, key=lambda h: h.get("timestamp") or "", reverse=True)
-
-
-def _recorded(hit: dict) -> str:
-    ts = hit.get("timestamp")
-    if not ts:
-        return "date unknown"
-    try:
-        return datetime.fromisoformat(str(ts)).strftime("%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        return "date unknown"
-
-
-def format_context(hits: list[dict], now: datetime | None = None) -> str:
-    """Build the dated prompt block of relevant memory facts, newest first."""
-    if not hits:
-        return ""
-    now = now or datetime.now(timezone.utc)
-    lines = [
-        f"Current time: {now.astimezone(timezone.utc):%Y-%m-%d %H:%M UTC}.",
-        "Relevant long-term memory about this user, newest first "
-        "(retrieved automatically; the user did not ask for it). "
-        "When facts conflict, the newest recorded one is the current truth:",
-    ]
-    lines += [
-        f"- [{_recorded(hit)}, {hit['source']}] {hit['text']}"
-        for hit in chronological(hits)
-    ]
-    return "\n".join(lines)
-
-
-def build_prompt_messages(
-    system_prompt: str,
-    messages: Sequence[AnyMessage],
-    memory_context: list[dict],
-) -> list[AnyMessage]:
-    """Assemble the per-call prompt; memory context is never written back to state."""
-    prompt: list[AnyMessage] = [SystemMessage(content=system_prompt)]
-    memory_block = format_context(memory_context)
-    if memory_block:
-        prompt.append(SystemMessage(content=memory_block))
-    for message in messages:
-        if isinstance(message, SystemMessage):
-            continue
-        prompt.append(message)
-    return prompt
-
-
 def default_client():
-    """Return the configured OpenAI Responses client used for memory planning/extraction."""
+    """Return the configured OpenAI Responses client used for memory planning."""
     return get_responses_client()

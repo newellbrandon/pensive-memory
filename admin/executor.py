@@ -20,7 +20,6 @@ from typing import Callable
 import httpx
 from ddgs import DDGS
 
-from config import Config
 from documents import service as documents_service
 
 logger = logging.getLogger(__name__)
@@ -365,60 +364,23 @@ _MEMORY_HITS_LIMIT = 5
 
 
 def _memories_for_query(query: str, user_id: str) -> list[dict]:
-    """Sweep Pensive's long-term memory for the query.
+    """Pensive's long-term memory, consulted BEFORE the document corpus.
 
-    Covers the run's own memory namespace, the console user's (``default``),
-    and every other agent's (and subagent's) namespace — so facts previously
-    retrieved and stored by this agent, the user, or any other agent can
-    answer from memory before the corpus is touched. One direct scan of the
-    memory collection (dev-scale: dozens of curated facts), query embedded
-    with the SAME Voyage model the store uses, so cosine scores are directly
-    comparable to the store's own vector search. Never raises.
+    Memory lives in the Agent Engine memory service, which is scoped per user,
+    so this searches the run's own scope and the console user's (``default``)
+    and merges the ranked hits. Never raises.
     """
-    try:
-        from utils.llm import get_embeddings
-        from persistence.mongo import get_client
+    from memory import agent_engine
 
-        vector = get_embeddings().embed_query(query)
-        if not vector:
-            return []
-        collection = get_client()[Config.MONGODB_DB]["agent_memories"]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("documents_search memory lookup failed: %s", exc)
-        return []
-    allowed_users = {user_id, "default"}
     hits: list[dict] = []
-    try:
-        for doc in collection.find({}):
-            namespace = doc.get("namespace") or []
-            if len(namespace) < 2:
-                continue
-            owner = str(namespace[1])
-            if owner not in allowed_users and not owner.startswith("agent:"):
-                continue
-            value = doc.get("value") or {}
-            if value.get("superseded_by_version_id") or value.get("superseded_by_snapshot"):
-                continue
-            text = str(value.get("content") or "")
-            if not text:
-                continue
-            score = documents_service.cosine(vector, list(doc.get("embedding") or []))
-            if score <= 0.0:
-                continue
-            hits.append(
-                {
-                    "text": text,
-                    "source": str(value.get("type") or "memory"),
-                    "similarity_score": round(score, 4),
-                    "timestamp": str(
-                        value.get("recorded_at") or value.get("updated_at") or ""
-                    )[:10],
-                }
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("documents_search memory sweep failed: %s", exc)
-        return []
-    hits.sort(key=lambda hit: hit["similarity_score"], reverse=True)
+    for scope in dict.fromkeys([user_id, "default"]):
+        try:
+            hits.extend(agent_engine.search(scope, query, top_k=8))
+        except Exception as exc:  # noqa: BLE001 — never block the corpus path
+            logger.warning("memory-first lookup failed for %s: %s", scope, exc)
+    hits.sort(
+        key=lambda hit: float(hit.get("similarity_score") or 0.0), reverse=True
+    )
     return hits
 
 

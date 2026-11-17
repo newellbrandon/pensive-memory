@@ -13,7 +13,7 @@ from agent.nodes import (
     search_long_term_memory,
 )
 from agent.state import AgentState
-from persistence.mongo import get_checkpointer, get_store
+from persistence.mongo import get_checkpointer
 
 _active_graph: Any = None
 
@@ -47,4 +47,4 @@ def build_graph():
     builder.add_edge("generate_response", "save_memory")
     builder.add_edge("save_memory", END)
 
-    return builder.compile(checkpointer=get_checkpointer(), store=get_store())
+    return builder.compile(checkpointer=get_checkpointer())

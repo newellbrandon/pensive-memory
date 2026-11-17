@@ -97,38 +97,6 @@ class FakeCollection:
         return 0
 
 
-class FakeStore:
-    def __init__(self):
-        self.calls = []
-        self.data = {}
-
-    def put(self, namespace, key, value, index=None, **kwargs):
-        self.calls.append(("put", namespace, key, value))
-        self.data[(tuple(namespace), key)] = value
-
-    def delete(self, namespace, key):
-        self.calls.append(("delete", namespace, key))
-        self.data.pop((tuple(namespace), key), None)
-
-
-def _memory_doc(key, mem_type="semantic", user_id="u1", label="name", content="Brandon"):
-    return {
-        "_id": f"{mem_type}:{key}",
-        "namespace": ["users", user_id, "memories", mem_type],
-        "key": key,
-        "value": {
-            "content": content,
-            "user_id": user_id,
-            "type": mem_type,
-            "label": label,
-            "recorded_at": "2026-10-01T00:00:00+00:00",
-            "updated_at": "2026-10-02T00:00:00+00:00",
-        },
-        "created_at": "2026-10-01T00:00:00+00:00",
-        "updated_at": "2026-10-02T00:00:00+00:00",
-    }
-
-
 class SystemPromptTest(unittest.TestCase):
     def test_default_falls_back_to_config(self):
         coll = FakeCollection()
@@ -163,85 +131,72 @@ class SystemPromptTest(unittest.TestCase):
 
 
 class MemoryCurationTest(unittest.TestCase):
-    def setUp(self):
-        self.coll = FakeCollection(
-            [
-                _memory_doc("k1"),
-                _memory_doc("k2", mem_type="taxonomic", content="MongoDB"),
-                _memory_doc("k3", user_id="other", content="someone else"),
-            ]
-        )
-        self.store = FakeStore()
+    """The console curates the Agent Engine memory service: ranked search reads
+    and semantic upsert edits. There is no delete or merge (the service
+    versions/supersedes memories itself)."""
 
-    def test_list_filters_by_user_and_type(self):
-        rows = admin.list_memories(
-            "u1", mem_type="semantic", collection=self.coll, store=self.store
-        )
-        self.assertEqual([r["content"] for r in rows], ["Brandon"])
-        rows_all = admin.list_memories("u1", collection=self.coll, store=self.store)
-        self.assertEqual(len(rows_all), 2)
+    def test_search_memories_uses_sdk_search(self):
+        hits = [
+            {
+                "text": "Brandon",
+                "source": "semantic",
+                "label": "name",
+                "id": "m1",
+                "similarity_score": 0.9,
+                "timestamp": None,
+            }
+        ]
+        with mock.patch.object(admin.agent_engine, "search", return_value=hits) as search:
+            rows = admin.search_memories("u1", "who is the user", "semantic")
+        self.assertEqual(rows[0]["content"], "Brandon")
+        self.assertEqual(rows[0]["type"], "semantic")
+        self.assertEqual(rows[0]["label"], "name")
+        self.assertEqual(search.call_args.args, ("u1", "who is the user"))
+        self.assertEqual(search.call_args.kwargs["sources"], ["semantic"])
 
-    def test_memory_counts_are_unfiltered_per_type(self):
-        counts = admin.memory_counts("u1", collection=self.coll, store=self.store)
-        self.assertEqual(counts["semantic"], 1)
+    def test_search_memories_defaults_to_all_four_types(self):
+        with mock.patch.object(admin.agent_engine, "search", return_value=[]) as search:
+            admin.search_memories("u1", "q")
+        self.assertEqual(
+            set(search.call_args.kwargs["sources"]),
+            {"semantic", "episodic", "taxonomic", "procedural"},
+        )
+
+    def test_memory_counts_counts_result_set_by_type(self):
+        rows = [{"type": "semantic"}, {"type": "semantic"}, {"type": "taxonomic"}]
+        counts = admin.memory_counts(rows)
+        self.assertEqual(counts["semantic"], 2)
         self.assertEqual(counts["taxonomic"], 1)
         self.assertEqual(counts["episodic"], 0)
 
-    def test_memory_counts_ignore_legacy_string_values(self):
-        legacy = {
-            "_id": "legacy",
-            "key": "k9",
-            "value": "{'content': 'old', 'user_id': 'u1', 'type': 'episodic'}",
-        }
-        self.coll.docs.append(legacy)
-        counts = admin.memory_counts("u1", collection=self.coll, store=self.store)
-        self.assertEqual(counts["episodic"], 0)
-
-    def test_update_memory_reembeds_via_store_put(self):
-        record = admin.update_memory(
-            "u1", "semantic", "k1", "Brandon Alexander",
-            collection=self.coll, store=self.store,
-        )
+    def test_update_memory_upserts_semantic(self):
+        with mock.patch.object(
+            admin.agent_engine,
+            "save_semantic",
+            return_value={"id": "m1", "label": "name", "content": "Brandon Alexander"},
+        ) as save:
+            record = admin.update_memory("u1", "semantic", "name", "Brandon Alexander")
         self.assertEqual(record["content"], "Brandon Alexander")
-        put_calls = [c for c in self.store.calls if c[0] == "put"]
-        self.assertEqual(len(put_calls), 1)
-        namespace, key, value = put_calls[0][1], put_calls[0][2], put_calls[0][3]
-        # Same namespace + key so the vector record is OVERWRITTEN (re-embed).
-        self.assertEqual(namespace, ("users", "u1", "memories", "semantic"))
-        self.assertEqual(key, "k1")
-        self.assertEqual(value["content"], "Brandon Alexander")
-        self.assertEqual(value["label"], "name")
-        self.assertTrue(value["updated_at"])
+        self.assertEqual(record["type"], "semantic")
+        self.assertEqual(save.call_args.args, ("u1", "name", "Brandon Alexander"))
 
-    def test_update_unknown_memory_raises(self):
-        with self.assertRaises(KeyError):
-            admin.update_memory(
-                "u1", "semantic", "missing", "x",
-                collection=self.coll, store=self.store,
-            )
-
-    def test_update_rejects_unknown_type(self):
+    def test_update_memory_rejects_non_semantic(self):
         with self.assertRaises(ValueError):
-            admin.update_memory(
-                "u1", "bogus", "k1", "x",
-                collection=self.coll, store=self.store,
-            )
+            admin.update_memory("u1", "episodic", "label", "x")
 
-    def test_delete_removes_memory(self):
-        deleted = admin.delete_memory(
-            "u1", "semantic", "k1", collection=self.coll, store=self.store
-        )
-        self.assertTrue(deleted)
-        self.assertIn(("delete", ("users", "u1", "memories", "semantic"), "k1"), self.store.calls)
-        self.assertFalse(
-            admin.delete_memory("u1", "semantic", "missing", collection=self.coll, store=self.store)
-        )
+    def test_update_memory_rejects_empty_content(self):
+        with self.assertRaises(ValueError):
+            admin.update_memory("u1", "semantic", "name", "   ")
+
+    def test_update_memory_raises_when_service_unavailable(self):
+        with mock.patch.object(admin.agent_engine, "save_semantic", return_value=None):
+            with self.assertRaises(RuntimeError):
+                admin.update_memory("u1", "semantic", "name", "x")
 
 
 class AgentRegistryTest(unittest.TestCase):
     def setUp(self):
         self.coll = FakeCollection()
-        self.store = FakeStore()
 
     def test_crud_roundtrip(self):
         agent = admin.create_agent(
@@ -1182,178 +1137,6 @@ def test_list_recent_runs_rejects_unknown_sort_field():
     assert response.status_code == 400
 
 
-class _MergeStore:
-    """Minimal store fake for merge tests: search returns pre-seeded items."""
-
-    def __init__(self, items=None):
-        self.items = items or []
-        self.puts = []
-        self.deletes = []
-
-    def search(self, namespace, query=None, limit=10, **kwargs):
-        return [i for i in self.items if i["key"] != query]
-
-    def put(self, namespace, key, value, index=None, **kwargs):
-        self.puts.append((key, value))
-
-    def delete(self, namespace, key):
-        self.deletes.append(key)
-
-
-def _merge_item(key, content, *, user_id="u1", mem_type="semantic", score=0.0, recorded_at=None):
-    return {
-        "key": key,
-        "value": {
-            "content": content,
-            "user_id": user_id,
-            "type": mem_type,
-            "label": f"label-{key}",
-            "recorded_at": recorded_at or "2026-10-01T00:00:00+00:00",
-        },
-        "score": score,
-    }
-
-
-def test_merge_duplicate_memories_groups_similar_and_prunes(monkeypatch):
-    # collection rows mirrored from list_memories: newest (updated_at) first,
-    # so the newest record is the merge anchor — two are near-duplicates
-    rows = [
-        {"key": "kB", "type": "semantic", "label": "b", "content": "Prefers Glean for internal search. Uses it daily.", "recorded_at": None, "updated_at": "2026-11-01T11:00:00"},
-        {"key": "kA", "type": "semantic", "label": "a", "content": "Prefers Glean for internal search.", "recorded_at": None, "updated_at": "2026-11-01T10:00:00"},
-        {"key": "kC", "type": "semantic", "label": "c", "content": "Likes dark mode.", "recorded_at": None, "updated_at": "2026-11-01T09:00:00"},
-    ]
-    monkeypatch.setattr(admin, "list_memories", lambda user_id, mem_type=None, **kw: rows)
-    store = _MergeStore(
-        [
-            _merge_item("kA", "Prefers Glean for internal search.", score=0.91),
-            _merge_item("kB", "Prefers Glean for internal search. Uses it daily.", score=0.95),
-            _merge_item("kC", "Likes dark mode.", score=0.4),
-        ]
-    )
-    polished = []
-
-    async def fake_consolidate(client, texts):
-        polished.append(texts)
-        collapsed = texts[0]
-        for fragment in texts[1:]:
-            collapsed = admin.merge_texts(collapsed, fragment)
-        return collapsed  # minimal polish: at least collapse duplicate lines
-
-    monkeypatch.setattr(admin, "consolidate_memories", fake_consolidate)
-    result = _run(admin.merge_duplicate_memories("u1", mem_type="semantic", store=store))
-    assert result["merged"] == 1
-    assert result["removed"] == 1
-    assert result["scanned"] == 3
-    # the newer record (kB) is the anchor; pruned sibling
-    merged_key, merged_value = store.puts[0]
-    assert merged_key == "kB"
-    # near-identical lines were collapsed BEFORE polish: one complete line
-    assert merged_value["content"].count("\n") == 0
-    assert "Uses it daily" in merged_value["content"]
-    assert "Glean" in merged_value["content"]
-    # LLM polish ran on the group's fragments
-    assert len(polished) == 1
-    assert len(polished[0]) == 2
-    assert store.deletes == ["kA"]
-    assert "kC" not in store.deletes
-
-
-def test_merge_duplicate_memories_uses_lexical_fallback_without_embeddings(monkeypatch):
-    rows = [
-        {"key": "x1", "type": "procedural", "label": "pref", "content": "Research answers based on high-trust sources.", "recorded_at": None, "updated_at": "2026-11-01T10:00:00"},
-        {"key": "x2", "type": "procedural", "label": "pref2", "content": "Research answers based on high-trust sources primarily.", "recorded_at": None, "updated_at": "2026-11-01T11:00:00"},
-    ]
-    monkeypatch.setattr(admin, "list_memories", lambda user_id, mem_type=None, **kw: rows)
-    store = _MergeStore([_merge_item("x1", "Research answers based on high-trust sources.", mem_type="procedural"),
-                         _merge_item("x2", "Research answers based on high-trust sources primarily.", mem_type="procedural")])
-    # store search reports no similarity (no embeddings): lexical overlap must catch it
-    for item in store.items:
-        item["score"] = None
-
-    async def fake_consolidate(client, texts):
-        return texts[0]  # full collapse: anchor ends up as the longest fragment
-
-    monkeypatch.setattr(admin, "consolidate_memories", fake_consolidate)
-    result = _run(admin.merge_duplicate_memories("u1", mem_type="procedural", store=store))
-    assert result["merged"] == 1
-    assert result["removed"] == 1
-
-
-def test_merge_duplicates_endpoint_delegates_to_service(monkeypatch):
-    async def fake_merge(user_id, mem_type=None, **kw):
-        return {"scanned": 3, "merged": 2, "removed": 2}
-
-    monkeypatch.setattr(admin, "merge_duplicate_memories", fake_merge)
-    response = _client.post(
-        "/api/admin/memories/merge-duplicates",
-        json={"user_id": "u1"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["merged"] == 2
-    assert body["removed"] == 2
-
-
-def test_merge_self_heals_literal_concatenations(monkeypatch):
-    # a single record that is itself a literal merge of near-identical lines
-    rows = [
-        {
-            "key": "kZ", "type": "semantic", "label": "prefs",
-            "content": "Prefers Glean for internal search.\nPrefers Glean for internal search. Uses it daily.",
-            "recorded_at": None, "updated_at": "2026-11-01T11:00:00",
-        },
-    ]
-    monkeypatch.setattr(admin, "list_memories", lambda user_id, mem_type=None, **kw: rows)
-    store = _MergeStore([_merge_item("kZ", rows[0]["content"], score=0.5)])  # no peer passes the bar
-    polished = []
-
-    async def fake_consolidate(client, texts):
-        polished.append(texts)
-        collapsed = texts[0]
-        for fragment in texts[1:]:
-            collapsed = admin.merge_texts(collapsed, fragment)
-        return collapsed
-
-    monkeypatch.setattr(admin, "consolidate_memories", fake_consolidate)
-    result = _run(admin.merge_duplicate_memories("u1", mem_type="semantic", store=store))
-    assert result["merged"] == 0
-    assert result["removed"] == 0
-    assert result["polished"] == 1
-    # one complete line remains — the duplicate line item is gone
-    assert len(store.puts) == 1
-    assert store.puts[0][0] == "kZ"
-    assert store.puts[0][1]["content"].count("\n") == 0
-    assert "Uses it daily" in store.puts[0][1]["content"]
-    assert polished
-
-
-def test_merge_strips_empty_lines_and_consolidates_suspicious_rows(monkeypatch):
-    # two paraphrase-level lines (overlap >= 0.5 but neither is a superset)
-    rows = [
-        {
-            "key": "kP", "type": "semantic", "label": "vision",
-            "content": (
-                "The user's intended agentic-memory experience is: natural-language queries go in.\n"
-                "The user's target interaction model is natural-language queries as input.\n"
-            ),
-            "recorded_at": None, "updated_at": "2026-11-01T11:00:00",
-        },
-    ]
-    monkeypatch.setattr(admin, "list_memories", lambda user_id, mem_type=None, **kw: rows)
-    store = _MergeStore([_merge_item("kP", rows[0]["content"], score=0.5)])
-
-    async def fake_consolidate(client, texts):
-        return "The user's vision: natural-language queries go in and context-enriched results come out."
-
-    monkeypatch.setattr(admin, "consolidate_memories", fake_consolidate)
-    result = _run(admin.merge_duplicate_memories("u1", mem_type="semantic", store=store))
-    assert result["polished"] == 1
-    assert result["merged"] == 0
-    content = store.puts[0][1]["content"]
-    assert content.count("\n") == 0  # consolidated + trailing blank line stripped
-    assert "vision" in content
-
-
 def test_list_recent_runs_endpoint_filters_by_executor(monkeypatch):
     captured = {}
 
@@ -1384,50 +1167,39 @@ def test_memory_types_describe_all_four():
     assert "skills" in by_type["procedural"]["description"].lower()
 
 
-def test_list_memories_delegates_to_service(monkeypatch):
+def test_search_memories_endpoint_delegates_to_service(monkeypatch):
     monkeypatch.setattr(
-        admin, "list_memories",
-        lambda user_id, mem_type=None: [
-            {"key": "k1", "type": "semantic", "label": "name",
-             "content": "Brandon", "recorded_at": None, "updated_at": None}
+        admin, "search_memories",
+        lambda user_id, query="", mem_type=None: [
+            {"id": "m1", "type": "semantic", "label": "name",
+             "content": "Brandon", "similarity_score": 0.9, "updated_at": None}
         ],
     )
-    monkeypatch.setattr(
-        admin, "memory_counts",
-        lambda user_id: {"semantic": 1, "episodic": 0, "taxonomic": 0, "procedural": 0},
-    )
-    response = _client.get("/api/admin/memories?user_id=u1&mem_type=semantic")
+    response = _client.get("/api/admin/memories?user_id=u1&query=who&mem_type=semantic")
     assert response.status_code == 200
     body = response.json()
     assert body["user_id"] == "u1"
+    assert body["query"] == "who"
     assert body["memories"][0]["content"] == "Brandon"
     assert body["counts"]["semantic"] == 1
 
 
-def test_update_memory_maps_errors(monkeypatch):
+def test_update_memory_endpoint_maps_errors(monkeypatch):
     monkeypatch.setattr(
         admin, "update_memory",
-        lambda user_id, mem_type, key, content: {"key": key, "content": content},
+        lambda user_id, mem_type, label, content: {"label": label, "content": content},
     )
-    ok = _client.put("/api/admin/memories/semantic/k1?user_id=u1", json={"content": "new"})
+    ok = _client.put("/api/admin/memories/semantic/name?user_id=u1", json={"content": "new"})
     assert ok.status_code == 200
     assert ok.json()["memory"]["content"] == "new"
 
-    monkeypatch.setattr(admin, "update_memory", lambda *a, **k: (_ for _ in ()).throw(KeyError("missing")))
-    not_found = _client.put("/api/admin/memories/semantic/k1", json={"content": "x"})
-    assert not_found.status_code == 404
-
     monkeypatch.setattr(admin, "update_memory", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad type")))
-    bad = _client.put("/api/admin/memories/bogus/k1", json={"content": "x"})
+    bad = _client.put("/api/admin/memories/bogus/x", json={"content": "x"})
     assert bad.status_code == 400
 
-
-def test_delete_memory_404_when_missing(monkeypatch):
-    monkeypatch.setattr(admin, "delete_memory", lambda *a, **k: False)
-    response = _client.delete("/api/admin/memories/semantic/k1?user_id=u1")
-    assert response.status_code == 404
-    monkeypatch.setattr(admin, "delete_memory", lambda *a, **k: True)
-    assert _client.delete("/api/admin/memories/semantic/k1?user_id=u1").status_code == 200
+    monkeypatch.setattr(admin, "update_memory", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("memory service unavailable")))
+    down = _client.put("/api/admin/memories/semantic/name", json={"content": "x"})
+    assert down.status_code == 503
 
 
 def test_system_prompt_roundtrip(monkeypatch):

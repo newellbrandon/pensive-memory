@@ -14,6 +14,9 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     decisions: Annotated[list[dict], operator.add]
     user_id: str
+    # Conversation/session identity for Agent Engine memory (the checkpoint
+    # thread id): turns are recorded and context is scoped under it.
+    session_id: str
     intent: str
     retrieved_memories: list[dict]
     response: str
@@ -31,10 +34,10 @@ class AgentState(TypedDict):
     # Full incoming request transcript for this turn (harness context). Kept
     # separate from `messages` so it is not re-accumulated by the checkpointer.
     prompt_messages: list[AnyMessage]
-    # Four-type long-term memory (semantic/episodic/taxonomic/procedural).
+    # Four-type long-term memory (semantic/episodic/taxonomic/procedural),
+    # served by the Agent Engine memory service.
     memory_needed: bool
     memory_query: str
-    memory_candidates: list[dict]
     memory_context: list[dict]
     # Research-classified turns (current/external/multi-source info needed)
     # deterministically delegate to a subagent before the model answers.

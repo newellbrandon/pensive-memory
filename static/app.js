@@ -81,7 +81,7 @@ async function loadTypes() {
   state.types = data.types;
   const grid = document.getElementById("type-grid");
   grid.innerHTML = "";
-  const all = typeCard(null, "All types", "Every memory for this user across the four types");
+  const all = typeCard(null, "All types", "Every memory the service returns for this query");
   all.dataset.type = "all";
   all.classList.toggle("selected", state.mem_type === null);
   grid.appendChild(all);
@@ -117,16 +117,25 @@ function typeCard(type, name, description) {
 
 async function loadMemories() {
   const user_id = document.getElementById("user-id").value.trim() || "default";
+  const query = document.getElementById("memory-query").value.trim();
   state.user_id = user_id;
-  const params = new URLSearchParams({ user_id });
+  state.query = query;
+  const list = document.getElementById("memory-list");
+  if (!query) {
+    // The Agent Engine memory service is searched, not listed: a query is
+    // required to rank a user's memories.
+    list.innerHTML = `<div class="empty">Enter a query to search “${esc(user_id)}”'s memory.</div>`;
+    updateCounts({});
+    return;
+  }
+  const params = new URLSearchParams({ user_id, query });
   if (state.mem_type) params.set("mem_type", state.mem_type);
   try {
     const data = await api(`/api/admin/memories?${params}`);
     renderMemories(data.memories);
     updateCounts(data.counts);
   } catch (error) {
-    document.getElementById("memory-list").innerHTML =
-      `<div class="empty">Could not load memories: ${esc(error.message)}</div>`;
+    list.innerHTML = `<div class="empty">Could not search memories: ${esc(error.message)}</div>`;
   }
 }
 
@@ -141,24 +150,23 @@ function setCardCount(card, text) {
 }
 
 function updateCounts(counts) {
-  // Counts come from the API computed UNFILTERED, so panel badges stay
-  // correct no matter which type filter is currently active.
+  // Counts describe the current result set per type.
   const map = counts || {};
   let total = 0;
   for (const value of Object.values(map)) total += value;
   const allCard = document.querySelector('.type-card[data-type="all"]');
-  if (allCard) setCardCount(allCard, total === 1 ? "1 memory total" : `${total} memories total`);
+  if (allCard) setCardCount(allCard, total === 1 ? "1 result" : `${total} results`);
   for (const meta of state.types) {
     const count = map[meta.type] ?? 0;
     const card = document.querySelector(`.type-card[data-type="${meta.type}"]`);
-    if (card) setCardCount(card, count === 1 ? "1 memory" : `${count} memories`);
+    if (card) setCardCount(card, count === 1 ? "1 result" : `${count} results`);
   }
 }
 
 function renderMemories(rows) {
   const list = document.getElementById("memory-list");
   if (!rows.length) {
-    list.innerHTML = `<div class="empty">No memories found${state.mem_type ? ` of type ${state.mem_type}` : ""} for user “${esc(state.user_id)}”.</div>`;
+    list.innerHTML = `<div class="empty">No memories matched${state.mem_type ? ` (${esc(state.mem_type)})` : ""} for “${esc(state.query)}”.</div>`;
     return;
   }
   list.innerHTML = "";
@@ -174,19 +182,21 @@ function memoryRow(row) {
 
   const meta = state.types.find((t) => t.type === row.type);
   const subtitle = meta ? meta.description : "";
+  const score =
+    row.similarity_score != null ? ` · score ${Number(row.similarity_score).toFixed(2)}` : "";
+  const editable = row.type === "semantic";
 
   div.innerHTML = `
     <div class="row-head">
       <span class="badge" style="background:${TYPE_COLORS[row.type] || "#00ed64"}22;color:${TYPE_COLORS[row.type] || "#00ed64"}">${esc(row.type)}</span>
-      <span class="label" title="${esc(subtitle)}">${esc(row.label || row.key || "")}</span>
-      <span class="when">${fmtWhen(row.updated_at || row.recorded_at)}</span>
+      <span class="label" title="${esc(subtitle)}">${esc(row.label || "")}</span>
+      <span class="when">${fmtWhen(row.updated_at)}${score}</span>
     </div>
     <p class="content">${esc(row.content)}</p>
-    <div class="row-actions">
-      <button class="btn ghost small" data-action="edit">Edit</button>
-      <button class="btn danger small" data-action="delete">Prune</button>
-    </div>
+    ${editable ? '<div class="row-actions"><button class="btn ghost small" data-action="edit">Edit</button></div>' : ""}
   `;
+
+  if (!editable) return div;
 
   div.querySelector('[data-action="edit"]').addEventListener("click", () => {
     div.querySelector(".row-actions").remove();
@@ -202,14 +212,13 @@ function memoryRow(row) {
     cancel.className = "btn ghost small";
     cancel.textContent = "Cancel";
     actions.append(save, cancel);
-    div.insertBefore(textarea, div.querySelector(".memory-row > .content").nextSibling ?? null);
     div.querySelector(".content").replaceWith(textarea);
     div.appendChild(actions);
     cancel.addEventListener("click", () => loadMemories());
     save.addEventListener("click", async () => {
       save.disabled = true;
       try {
-        await updateMemory(row.type, row.key, textarea.value);
+        await updateMemory(row.type, row.label, textarea.value);
         toast("Memory corrected and re-embedded");
         loadMemories();
       } catch (error) {
@@ -219,26 +228,12 @@ function memoryRow(row) {
     });
   });
 
-  div.querySelector('[data-action="delete"]').addEventListener("click", async () => {
-    if (!confirm(`Prune this ${row.type} memory?\n\n${row.content}`)) return;
-    try {
-      await api(
-        `/api/admin/memories/${encodeURIComponent(row.type)}/${encodeURIComponent(row.key)}?user_id=${encodeURIComponent(state.user_id)}`,
-        { method: "DELETE" },
-      );
-      toast("Memory pruned");
-      loadMemories();
-    } catch (error) {
-      toast(error.message, true);
-    }
-  });
-
   return div;
 }
 
-async function updateMemory(type, key, content) {
+async function updateMemory(type, label, content) {
   return api(
-    `/api/admin/memories/${encodeURIComponent(type)}/${encodeURIComponent(key)}?user_id=${encodeURIComponent(state.user_id)}`,
+    `/api/admin/memories/${encodeURIComponent(type)}/${encodeURIComponent(label)}?user_id=${encodeURIComponent(state.user_id)}`,
     {
       method: "PUT",
       body: JSON.stringify({ content }),
@@ -247,44 +242,11 @@ async function updateMemory(type, key, content) {
 }
 
 document.getElementById("user-id").addEventListener("change", loadMemories);
-document.getElementById("refresh-memories").addEventListener("click", loadMemories);
-
-/* ---------- memory cleanup: merge duplicates ---------- */
-
-document.getElementById("merge-memories").addEventListener("click", async () => {
-  const user_id = document.getElementById("user-id").value.trim() || "default";
-  if (
-    !confirm(
-      "Merge semantically similar memories into one complete curated memory each? " +
-        "The newest copy becomes the anchor (contents combined), duplicate copies are deleted.",
-    )
-  ) {
-    return;
-  }
-  const button = document.getElementById("merge-memories");
-  button.disabled = true;
-  try {
-    const result = await api("/api/admin/memories/merge-duplicates", {
-      method: "POST",
-      body: JSON.stringify({ user_id }),
-    });
-    if (result.merged === 0 && result.polished === 0) {
-      toast("No duplicate memories found — the store is already curated");
-    } else {
-      const bits = [];
-      if (result.merged) bits.push(`merged ${result.merged} group(s) into curated memories`);
-      if (result.removed) bits.push(`removed ${result.removed} duplicate(s)`);
-      if (result.polished) bits.push(`de-duplicated ${result.polished} concatenated memory(s)`);
-      toast(cap(bits.join("; ")));
-    }
-    loadMemories();
-    loadTypes();
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    button.disabled = false;
-  }
+document.getElementById("memory-query").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") loadMemories();
 });
+document.getElementById("search-memories").addEventListener("click", loadMemories);
+document.getElementById("refresh-memories").addEventListener("click", loadMemories);
 
 /* ---------- system prompt ---------- */
 

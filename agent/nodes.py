@@ -10,13 +10,12 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.config import get_stream_writer
 from langgraph.runtime import Runtime
-from langgraph.store.base import BaseStore
 
 from admin import service as admin
 from admin.executor import PROJECT_TOOL_NAMES, execute_project_tool_call
 from glean.client import TOOL_PREFIX, get_glean_client
 from agent.state import AgentState
-from memory import memories
+from memory import agent_engine, memories
 from utils.llm import get_responses_client
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,23 @@ def _emit_decision(step: str, decision: str, reason: str) -> None:
 
 def _latest_user_message(state: AgentState) -> str:
     return memories.latest_user_text(state["messages"])
+
+
+def _memory_messages(memory_context: list[dict]) -> list:
+    """Render Agent Engine context as ONE injected system block.
+
+    The service returns role-tagged messages, but for a harness backend memory
+    is background context, not the user's words: folding it into a single
+    system message keeps it from masquerading as a real turn in the transcript.
+    """
+    parts = [
+        str(item.get("content"))
+        for item in (memory_context or [])
+        if isinstance(item, dict) and item.get("content")
+    ]
+    if not parts:
+        return []
+    return [SystemMessage(content="\n".join(parts))]
 
 
 # Model context budget. The client transcript is the HARNESS CONTRACT and is
@@ -138,35 +154,35 @@ def route_after_intent(state: AgentState) -> Literal["search_long_term_memory", 
     return "generate_response"
 
 
-async def search_long_term_memory(state: AgentState, runtime: Runtime) -> dict:
-    """Search all four memory types for the current user and rerank the hits."""
-    user_id = state.get("user_id")
+async def search_long_term_memory(state: AgentState, runtime: Runtime | None = None) -> dict:
+    """Assemble long-term memory context for the current user.
+
+    The Agent Engine memory service does the retrieval (vector + text ranking,
+    dedup and token budgeting) behind ``Memory.build_context``; STM is excluded
+    because the harness transcript already carries the current conversation.
+    """
+    user_id = state.get("user_id") or ""
+    session_id = state.get("session_id") or ""
     query = state.get("memory_query") or ""
-    store: BaseStore | None = runtime.store
 
-    candidates = memories.retrieve(store, query, user_id, sources=memories.ALL_TYPES)
-    hits = memories.rerank(query, candidates) if query else []
-
-    counts = {mem_type: 0 for mem_type in memories.MEMORY_TYPES}
-    for hit in hits:
-        counts[hit.get("source", "unknown")] = counts.get(hit.get("source", "unknown"), 0) + 1
-    summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
-    reason = (
-        f"Found {len(hits)} relevant memories ({summary})."
-        if summary
-        else "No relevant memories found in any type."
+    context = (
+        agent_engine.build_context(user_id, session_id, query) if query else []
     )
 
-    _emit_decision("search_long_term_memory", f"{len(hits)} results", reason)
+    reason = (
+        f"Assembled memory context ({len(context)} message(s))."
+        if context
+        else "No relevant long-term memory found."
+    )
+    _emit_decision("search_long_term_memory", f"{len(context)} results", reason)
     decision = {
         "step": "search_long_term_memory",
-        "decision": str(len(hits)),
+        "decision": str(len(context)),
         "reason": reason,
     }
     return {
-        "memory_candidates": candidates,
-        "memory_context": hits,
-        "retrieved_memories": hits,
+        "memory_context": context,
+        "retrieved_memories": context,
         "decisions": [decision],
     }
 
@@ -194,13 +210,11 @@ async def generate_response(state: AgentState) -> dict:
     # and conversation history all flow to the model. Pensive adds persistent
     # memory on top and does not override the caller's instructions.
     transcript = state.get("prompt_messages") or state["messages"]
-    memory_block = memories.format_context(memory_context)
     prompt_messages: list = []
     system_prompt = state.get("system_prompt") or ""
     if system_prompt:
         prompt_messages.append(SystemMessage(content=system_prompt))
-    if memory_block:
-        prompt_messages.append(SystemMessage(content=memory_block))
+    prompt_messages.extend(_memory_messages(memory_context))
     prompt_messages.extend(transcript)
 
     client = get_responses_client()
@@ -624,28 +638,28 @@ def _parse_arguments(arguments: str) -> dict:
         return {}
 
 
-async def save_memory(state: AgentState, runtime: Runtime) -> dict:
-    """Extract durable facts from the user message and persist them by type."""
+async def save_memory(state: AgentState, runtime: Runtime | None = None) -> dict:
+    """Append this turn's user and assistant messages to Agent Engine memory.
+
+    The service extracts durable facts from recorded turns in the background,
+    so Pensive no longer runs its own extraction pass.
+    """
+    user_id = state.get("user_id") or ""
+    session_id = state.get("session_id") or ""
     query = _latest_user_message(state)
-    user_id = state.get("user_id")
-    store: BaseStore | None = runtime.store
+    response = state.get("response") or ""
 
-    if store is None or not user_id:
-        _emit_decision("save_memory", "skipped", "No store available.")
-        return {
-            "decisions": [
-                {"step": "save_memory", "decision": "skipped", "reason": "No store available."}
-            ]
-        }
-
-    client = get_responses_client()
-    saved = await memories.extract_and_save(client, store, query, user_id)
+    saved = 0
+    if agent_engine.record_turn(user_id, session_id, "user", query):
+        saved += 1
+    if agent_engine.record_turn(user_id, session_id, "assistant", response):
+        saved += 1
 
     if saved:
-        reason = f"Saved {saved} memory item(s)."
+        reason = f"Recorded {saved} conversation turn(s)."
         decision_label = "saved"
     else:
-        reason = "No durable fact to save."
+        reason = "No turn recorded (memory unavailable or empty)."
         decision_label = "skipped"
 
     _emit_decision("save_memory", decision_label, reason)

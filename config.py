@@ -37,6 +37,20 @@ class Config:
     LLM_EMBEDDING_KEY: str = os.getenv("LLM_EMBEDDING_KEY", "")
     EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 
+    # Atlas Agent Engine memory (agent-engine-sdk-memory). Pensive's long-term
+    # memory IS the Agent Engine memory service; the SDK reaches it either on
+    # the hosted platform (project id + service-account token) or a local dev
+    # stack's orchestration engine (base URL only). With none set, Pensive runs
+    # without long-term memory instead of failing every turn.
+    AGENTIC_MEMORY_BASE_URL: str = os.getenv("AGENTIC_MEMORY_BASE_URL", "")
+    AGENTIC_MEMORY_PROJECT_ID: str = os.getenv("AGENTIC_MEMORY_PROJECT_ID", "")
+    AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN: str = os.getenv(
+        "AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN", ""
+    )
+    # Gross context-construction budget for the memory block injected into the
+    # prompt (the server reserves 500 tokens of formatting overhead).
+    AGENTIC_MEMORY_MAX_TOKENS: int = int(os.getenv("AGENTIC_MEMORY_MAX_TOKENS", "2048"))
+
     # Contextualized chunk embeddings for document ingestion: the
     # <base>/contextualizedembeddings endpoint of the same Voyage surface as
     # LLM_EMBEDDING_URI (reuses LLM_EMBEDDING_KEY). Documents are embedded with

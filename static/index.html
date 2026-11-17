@@ -36,7 +36,7 @@
     <section id="tab-memories" class="tab-panel active">
       <div class="panel-head">
         <h1>Long-term memory</h1>
-        <p class="sub">Curate the four memory types Pensive persists per user. Edits are saved to MongoDB and <strong>re-embedded automatically</strong>.</p>
+        <p class="sub">Search the user's memory in the <strong>Atlas Agent Engine memory service</strong>. Semantic facts are editable and <strong>re-embedded automatically</strong> on save.</p>
       </div>
 
       <div class="type-grid" id="type-grid"></div>
@@ -46,8 +46,12 @@
           <span>User id</span>
           <input id="user-id" type="text" value="default" spellcheck="false" />
         </label>
+        <label class="field grow">
+          <span>Query</span>
+          <input id="memory-query" type="text" placeholder="e.g. preferred search tool" spellcheck="false" />
+        </label>
+        <button id="search-memories" class="btn primary">Search</button>
         <button id="refresh-memories" class="btn ghost">Refresh</button>
-        <button id="merge-memories" class="btn">Merge duplicates</button>
       </div>
 
       <div id="memory-list" class="memory-list"></div>

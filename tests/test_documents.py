@@ -643,9 +643,9 @@ class TestDocumentsSearchTool:
         corpus.assert_called_once()
 
     def test_memory_search_failure_degrades_to_corpus(self):
-        # the REAL _memories_for_query catches store failures internally, so
-        # a broken store must never block the corpus path
-        with mock.patch("utils.llm.get_embeddings", side_effect=RuntimeError("store down")):
+        # the REAL _memories_for_query swallows memory-service failures, so a
+        # broken memory backend must never block the corpus path
+        with mock.patch("memory.agent_engine.search", side_effect=RuntimeError("memory down")):
             with mock.patch(
                 "admin.executor.documents_service.search_documents_sync"
             ) as corpus:
@@ -674,61 +674,38 @@ class TestDocumentsSearchTool:
 
 
 class TestMemoriesForQuery:
-    """The memory sweep: own + default + other agents' namespaces."""
+    """The memory-first lookup goes through the Agent Engine SDK adapter,
+    searching the run's own scope plus the console user's (``default``)."""
 
-    def _sweep(self, docs, embedder_vector=(1.0, 0.0)):
+    def test_merges_run_scope_and_console_user_score_desc(self):
         from admin.executor import _memories_for_query
 
-        coll = FakeCollection(docs)
-        client = mock.Mock()
-        db = mock.Mock()
-        db.__getitem__ = mock.Mock(side_effect=lambda name: coll if name == "agent_memories" else mock.Mock())
-        client.__getitem__ = mock.Mock(return_value=db)
-        embeddings = mock.Mock()
-        embeddings.embed_query = mock.Mock(return_value=list(embedder_vector))
-        with mock.patch("persistence.mongo.get_client", return_value=client):
-            with mock.patch("utils.llm.get_embeddings", return_value=embeddings):
-                return _memories_for_query("cache eviction", "agent:aaa")
+        calls = []
 
-    def _doc(self, namespace, content, embedding, **value_extra):
-        return {
-            "namespace": namespace,
-            "embedding": embedding,
-            "value": {"content": content, "type": "semantic", **value_extra},
-        }
+        def fake_search(scope, query, **kwargs):
+            calls.append((scope, query))
+            score = 0.5 if scope == "agent:aaa" else 0.9
+            return [{"text": f"{scope} fact", "source": "semantic", "similarity_score": score}]
 
-    def test_covers_own_default_and_other_agents_but_not_foreign_users(self):
-        hits = self._sweep(
-            [
-                self._doc(["users", "agent:aaa", "memories", "semantic"], "own fact", [1.0, 0.0]),
-                self._doc(["users", "default", "memories", "semantic"], "user fact", [0.8, 0.6]),
-                self._doc(["users", "agent:bbb", "memories", "semantic"], "other agent fact", [0.6, 0.8]),
-                self._doc(["users", "stranger", "memories", "semantic"], "foreign fact", [0.9, 0.1]),
-            ]
-        )
-        texts = [h["text"] for h in hits]
-        assert texts == ["own fact", "user fact", "other agent fact"]  # score-desc
-        assert "foreign fact" not in texts
-        assert hits[0]["similarity_score"] == 1.0
-        assert hits[0]["source"] == "semantic"
+        with mock.patch("memory.agent_engine.search", side_effect=fake_search):
+            hits = _memories_for_query("cache eviction", "agent:aaa")
 
-    def test_skips_superseded_and_empty_memories(self):
-        hits = self._sweep(
-            [
-                self._doc(["users", "default", "memories", "semantic"], "good fact", [1.0, 0.0]),
-                self._doc(
-                    ["users", "default", "memories", "semantic"], "stale fact", [1.0, 0.0],
-                    superseded_by_snapshot=True,
-                ),
-                self._doc(["users", "default", "memories", "semantic"], "", [1.0, 0.0]),
-            ]
-        )
-        assert [h["text"] for h in hits] == ["good fact"]
+        assert [scope for scope, _ in calls] == ["agent:aaa", "default"]
+        assert calls[0][1] == "cache eviction"
+        assert [h["text"] for h in hits] == ["default fact", "agent:aaa fact"]
+        assert hits[0]["similarity_score"] == 0.9
 
-    def test_unreachable_store_returns_empty(self):
+    def test_does_not_search_the_same_scope_twice(self):
         from admin.executor import _memories_for_query
 
-        with mock.patch("persistence.mongo.get_client", side_effect=RuntimeError("db down")):
+        with mock.patch("memory.agent_engine.search", return_value=[]) as search:
+            _memories_for_query("q", "default")
+        assert search.call_count == 1
+
+    def test_unreachable_memory_returns_empty(self):
+        from admin.executor import _memories_for_query
+
+        with mock.patch("memory.agent_engine.search", side_effect=RuntimeError("db down")):
             assert _memories_for_query("q", "agent:aaa") == []
 
 

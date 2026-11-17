@@ -1,8 +1,9 @@
 """Pensive admin service: memory curation, system prompt, and isolated test agents.
 
-All curation writes go through the LangGraph MongoDBStore so vector embeddings
-are (re)computed automatically; listing reads the underlying Mongo collection
-(the Store API has no list-items call).
+Memory lives in the Atlas Agent Engine memory service: the console reads it with
+the SDK's ranked search and edits semantic facts by label (see
+``memory/agent_engine.py``). Pensive's own records (agents, runs, settings) stay
+in MongoDB.
 """
 from __future__ import annotations
 
@@ -23,19 +24,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from admin.executor import DEFAULT_AGENT_TOOLS, execute_tool_call, safe_workspace_path, workspace_root
 from documents import service as documents_service
 from glean.client import get_glean_client
-from utils.llm import get_responses_client
 from config import Config
-from memory.memories import (
-    MEMORY_MERGE_OVERLAP,
-    MEMORY_MERGE_SCORE,
-    MEMORY_TYPES,
-    _token_containment,
-    consolidate_memories,
-    lexical_similarity,
-    merge_texts,
-    namespace,
-)
-from persistence.mongo import get_client, get_store
+from memory import agent_engine
+from memory.memories import MEMORY_TYPES
+from persistence.mongo import get_client
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +69,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _memories_collection(collection: Collection | None = None) -> Collection:
-    if collection is not None:
-        return collection
-    return get_client()[Config.MONGODB_DB]["agent_memories"]
-
-
 def _settings_collection(collection: Collection | None = None) -> Collection:
     if collection is not None:
         return collection
@@ -101,12 +87,7 @@ def _runs_collection(collection: Collection | None = None) -> Collection:
     return get_client()[Config.MONGODB_DB]["pensive_agent_runs"]
 
 
-def _resolve_store(store) -> Any:
-    return store if store is not None else get_store()
-
-
 # --- system prompt -----------------------------------------------------------
-
 def get_system_prompt(collection: Collection | None = None) -> str:
     """Return the runtime system prompt (MongoDB override or env default)."""
     doc = _settings_collection(collection).find_one({"_id": SYSTEM_PROMPT_ID})
@@ -126,258 +107,59 @@ def set_system_prompt(text: str, collection: Collection | None = None) -> str:
 
 
 # --- memory curation ---------------------------------------------------------
+#
+# Memory lives in the Atlas Agent Engine memory service, so the console reads it
+# with the SDK's ranked search and edits it by re-saving a semantic fact (upsert
+# by label). There is deliberately no delete or merge: the service versions and
+# supersedes memories itself as it extracts them.
 
-def list_memories(
+
+def search_memories(
     user_id: str = DEFAULT_USER_ID,
+    query: str = "",
     mem_type: Optional[str] = None,
-    *,
-    collection: Collection | None = None,
-    store=None,
 ) -> list[dict]:
-    """List curatable memories for a user, optionally filtered by type."""
-    del store  # store kept in the signature for dependency symmetry
-    query: dict = {"value.user_id": user_id}
-    if mem_type:
-        query["value.type"] = mem_type
-    rows: list[dict] = []
-    for doc in _memories_collection(collection).find(query).sort("updated_at", -1):
-        value = doc.get("value")
-        if not isinstance(value, dict):
-            continue
-        rows.append(
-            {
-                "key": doc.get("key") or "",
-                "type": value.get("type") or mem_type or "",
-                "label": value.get("label") or "",
-                "content": value.get("content") or "",
-                "recorded_at": value.get("recorded_at"),
-                "updated_at": doc.get("updated_at") or value.get("updated_at"),
-            }
-        )
-    return rows
+    """Ranked memories for a query, optionally restricted to one type."""
+    sources = [mem_type] if mem_type else list(MEMORY_TYPES)
+    hits = agent_engine.search(user_id, query, sources=sources, top_k=50)
+    return [
+        {
+            "id": hit.get("id") or "",
+            "type": hit.get("source") or "",
+            "label": hit.get("label") or "",
+            "content": hit.get("text") or "",
+            "similarity_score": hit.get("similarity_score"),
+            "updated_at": hit.get("timestamp"),
+        }
+        for hit in hits
+    ]
 
 
-def memory_counts(
-    user_id: str = DEFAULT_USER_ID,
-    *,
-    collection: Collection | None = None,
-    store=None,
-) -> dict[str, int]:
-    """Per-type memory counts for a user, always computed UNFILTERED so panel
-    badges stay correct regardless of any active type filter in the UI."""
-    del store
+def memory_counts(rows: list[dict]) -> dict[str, int]:
+    """Per-type counts for a result set (drives the console type cards)."""
     counts: dict[str, int] = {mem_type: 0 for mem_type in MEMORY_TYPES}
-    for doc in _memories_collection(collection).find({"value.user_id": user_id}):
-        value = doc.get("value")
-        if not isinstance(value, dict):
-            continue  # legacy string-encoded records are not curatable
-        mem_type = value.get("type")
+    for row in rows:
+        mem_type = row.get("type")
         if mem_type in counts:
             counts[mem_type] += 1
     return counts
 
 
-def _record_from_value(key: str, value: dict) -> dict:
-    return {
-        "key": key,
-        "type": value.get("type") or "",
-        "label": value.get("label") or "",
-        "content": value.get("content") or "",
-        "recorded_at": value.get("recorded_at"),
-        "updated_at": value.get("updated_at"),
-    }
-
-
-def update_memory(
-    user_id: str,
-    mem_type: str,
-    key: str,
-    content: str,
-    *,
-    collection: Collection | None = None,
-    store=None,
-) -> dict:
-    """Correct a memory in place. ``store.put`` on the same key re-embeds it."""
-    if mem_type not in MEMORY_TYPES:
-        raise ValueError(f"unknown memory type: {mem_type}")
+def update_memory(user_id: str, mem_type: str, label: str, content: str) -> dict:
+    """Correct a semantic memory in place (upsert by label in the memory service)."""
+    if mem_type != "semantic":
+        raise ValueError("only semantic memories are editable")
     if not content.strip():
         raise ValueError("memory content cannot be empty")
-    coll = _memories_collection(collection)
-    existing = coll.find_one(
-        {"key": key, "value.user_id": user_id, "value.type": mem_type}
-    )
-    if existing is None:
-        raise KeyError(f"memory not found: {mem_type}/{key}")
-    value = dict(existing.get("value") or {})
-    value["content"] = content
-    value["updated_at"] = _now()
-    _resolve_store(store).put(namespace(user_id, mem_type), key, value)
-    return _record_from_value(key, value)
-
-
-def delete_memory(
-    user_id: str,
-    mem_type: str,
-    key: str,
-    *,
-    collection: Collection | None = None,
-    store=None,
-) -> bool:
-    """Prune a memory. Returns True when a record was removed."""
-    if mem_type not in MEMORY_TYPES:
-        raise ValueError(f"unknown memory type: {mem_type}")
-    coll = _memories_collection(collection)
-    exists = coll.find_one(
-        {"key": key, "value.user_id": user_id, "value.type": mem_type}
-    ) is not None
-    if exists:
-        _resolve_store(store).delete(namespace(user_id, mem_type), key)
-    return exists
-
-
-def _similar_memory_peers(
-    store: Any,
-    user_id: str,
-    mem_type: str,
-    anchor_key: str,
-    anchor_content: str,
-    rows: list[dict],
-    grouped: set,
-) -> list[dict]:
-    """Near-duplicate rows of the same memory (vector sim with lexical
-    fallback), excluding the anchor and already-grouped keys."""
-    try:
-        hits = store.search(namespace(user_id, mem_type), query=anchor_content, limit=8) or []
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Memory merge search failed (%s: %s)", type(exc).__name__, exc
-        )
-        hits = []
-    peers: list[dict] = []
-    by_key = {r["key"]: r for r in rows}
-    for item in hits:
-        if isinstance(item, dict):
-            value = item.get("value") or {}
-            hit_key = item.get("key") or value.get("key")
-            score = item.get("score")
-        else:
-            value = getattr(item, "value", None) or {}
-            hit_key = getattr(item, "key", None) or value.get("key")
-            score = getattr(item, "score", None)
-        if not hit_key or hit_key == anchor_key or hit_key in grouped:
-            continue
-        if str(value.get("user_id") or "") != user_id:
-            continue
-        row = by_key.get(hit_key)
-        if row is None:
-            continue
-        if score is not None:
-            if float(score) < MEMORY_MERGE_SCORE:
-                continue
-        elif lexical_similarity(anchor_content, str(row.get("content") or "")) < MEMORY_MERGE_OVERLAP:
-            continue
-        peers.append(row)
-    return peers
-
-
-async def merge_duplicate_memories(
-    user_id: str = DEFAULT_USER_ID,
-    mem_type: Optional[str] = None,
-    *,
-    collection: Collection | None = None,
-    store=None,
-) -> dict:
-    """Query all semantically similar memories together and curate each group
-    into ONE complete memory: the most recently updated record is the anchor
-    (its key, label, and newest position), near-identical lines collapse
-    heuristically (longer version wins), an LLM consolidation pass folds the
-    group's fragments into one flowing curated memory (best-effort; the
-    heuristic result stands if the model fails), and the duplicate copies are
-    deleted. Returns scan/merge/removal counts. Similarity detection uses
-    vector search with a lexical fallback when embeddings are unavailable."""
-    store_resolved = _resolve_store(store)
-    types = [mem_type] if mem_type else list(MEMORY_TYPES)
-    client = get_responses_client()
-    scanned = 0
-    merged = 0
-    removed = 0
-    polished = 0
-    for mem_type_current in types:
-        rows = list_memories(user_id, mem_type_current, collection=collection)
-        grouped: set = set()
-        for row in rows:  # newest-first: the anchor is the most recent record
-            scanned += 1
-            key = row["key"]
-            if key in grouped:
-                continue
-            grouped.add(key)
-            content = row["content"] or ""
-            # Self-heal: a record that is itself a literal concatenation of
-            # near-identical fragments collapses to its fuller version; rows
-            # with suspiciously overlapping lines (paraphrase-level dupes)
-            # get the LLM consolidation pass so they read as ONE memory.
-            lines = [l.strip() for l in content.splitlines() if l.strip()]
-            if len(lines) > 1:
-                collapsed = lines[0]
-                for line in lines[1:]:
-                    collapsed = merge_texts(collapsed, line)
-                suspicious = any(
-                    _token_containment(a, b) >= 0.5
-                    for i, a in enumerate(lines)
-                    for b in lines[i + 1 :]
-                )
-                polished_text = ""
-                if suspicious or collapsed != content.strip():
-                    polished_text = await consolidate_memories(client, lines) or collapsed
-                if polished_text and polished_text != content.strip():
-                    content = "\n".join(l.strip() for l in polished_text.splitlines() if l.strip())
-                    polished += 1
-                    store_resolved.put(
-                        namespace(user_id, mem_type_current),
-                        key,
-                        {
-                            "content": content,
-                            "user_id": user_id,
-                            "type": mem_type_current,
-                            "label": row.get("label") or mem_type_current,
-                            "recorded_at": row.get("recorded_at"),
-                            "updated_at": _now(),
-                        },
-                    )
-            peers = _similar_memory_peers(
-                store_resolved, user_id, mem_type_current, key, content, rows, grouped
-            )
-            if not peers:
-                continue
-            merged += 1
-            fragments = [content] + [p["content"] for p in peers]
-            recorded_at = row.get("recorded_at")
-            for peer in peers:
-                recorded_at = recorded_at or peer.get("recorded_at")
-                grouped.add(peer["key"])
-                removed += 1
-            collapsed = fragments[0]
-            for fragment in fragments[1:]:
-                collapsed = merge_texts(collapsed, fragment)
-            # LLM polish: fold the collapsed fragments into one curated memory
-            polished_text = await consolidate_memories(client, fragments)
-            content = polished_text or collapsed
-            content = "\n".join(l.strip() for l in content.splitlines() if l.strip())
-            store_resolved.put(
-                namespace(user_id, mem_type_current),
-                key,
-                {
-                    "content": content,
-                    "user_id": user_id,
-                    "type": mem_type_current,
-                    "label": row.get("label") or mem_type_current,
-                    "recorded_at": recorded_at,
-                    "updated_at": _now(),
-                },
-            )
-            for peer in peers:
-                store_resolved.delete(namespace(user_id, mem_type_current), peer["key"])
-    return {"scanned": scanned, "merged": merged, "removed": removed, "polished": polished}
+    record = agent_engine.save_semantic(user_id, label, content)
+    if record is None:
+        raise RuntimeError("memory service unavailable")
+    return {
+        "id": record.get("id") or "",
+        "type": mem_type,
+        "label": record.get("label") or label,
+        "content": record.get("content") or content,
+    }
 
 
 # --- test agents -------------------------------------------------------------
@@ -814,12 +596,12 @@ async def _invoke_agent_step(
         ),
         "decisions": [],
         "user_id": user_id,
+        "session_id": thread_id,
         "intent": "",
         "retrieved_memories": [],
         "response": "",
         "memory_needed": False,
         "memory_query": "",
-        "memory_candidates": [],
         "memory_context": [],
         "tools": tools if tools is not None else (agent.get("tools") or DEFAULT_AGENT_TOOLS),
         "tool_choice": None,

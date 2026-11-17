@@ -30,11 +30,6 @@ class MemoryUpdateRequest(BaseModel):
     content: str
 
 
-class MemoryMergeRequest(BaseModel):
-    user_id: str = "default"
-    mem_type: Optional[str] = None
-
-
 class SystemPromptRequest(BaseModel):
     text: str = ""
 
@@ -67,47 +62,31 @@ async def get_memory_types() -> dict:
 
 
 @router.get("/memories")
-async def list_memories(user_id: str = "default", mem_type: Optional[str] = None) -> dict:
-    try:
-        rows = admin.list_memories(user_id, mem_type)
-    except ValueError as exc:
-        raise _bad_request(exc)
-    counts = admin.memory_counts(user_id)
-    return {"user_id": user_id, "memories": rows, "counts": counts}
-
-
-@router.put("/memories/{mem_type}/{key}")
-async def update_memory(
-    mem_type: str, key: str, body: MemoryUpdateRequest, user_id: str = "default"
+async def search_memories(
+    user_id: str = "default", query: str = "", mem_type: Optional[str] = None
 ) -> dict:
+    """Ranked memory search for the console (backed by the Agent Engine SDK)."""
+    rows = admin.search_memories(user_id, query, mem_type)
+    return {
+        "user_id": user_id,
+        "query": query,
+        "memories": rows,
+        "counts": admin.memory_counts(rows),
+    }
+
+
+@router.put("/memories/{mem_type}/{label}")
+async def update_memory(
+    mem_type: str, label: str, body: MemoryUpdateRequest, user_id: str = "default"
+) -> dict:
+    """Correct a semantic memory; the memory service re-embeds it on upsert."""
     try:
-        record = admin.update_memory(user_id, mem_type, key, body.content)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        record = admin.update_memory(user_id, mem_type, label, body.content)
     except ValueError as exc:
         raise _bad_request(exc)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {"memory": record}
-
-
-@router.post("/memories/merge-duplicates")
-async def merge_duplicate_memories(body: MemoryMergeRequest) -> dict:
-    """Group semantically similar memories into one complete curated memory
-    each (newest record wins as anchor, contents merged, copies deleted)."""
-    try:
-        return await admin.merge_duplicate_memories(body.user_id, body.mem_type)
-    except ValueError as exc:
-        raise _bad_request(exc)
-
-
-@router.delete("/memories/{mem_type}/{key}")
-async def delete_memory(mem_type: str, key: str, user_id: str = "default") -> dict:
-    try:
-        deleted = admin.delete_memory(user_id, mem_type, key)
-    except ValueError as exc:
-        raise _bad_request(exc)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"memory not found: {mem_type}/{key}")
-    return {"deleted": True}
 
 
 @router.get("/system-prompt")
