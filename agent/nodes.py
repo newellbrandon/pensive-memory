@@ -1,6 +1,7 @@
 """LangGraph agent nodes with four-type long-term memory and streamed decisions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -30,33 +31,72 @@ def _latest_user_message(state: AgentState) -> str:
     return memories.latest_user_text(state["messages"])
 
 
-# Model-visible window for the generate loop: system frames (persona/memory)
-# + the task and most recent activity are kept; middle history is dropped so
-# multi-step server loops do not retransmit every prior tool result verbatim.
+# Model context budget. The client transcript is the HARNESS CONTRACT and is
+# always sent in full: windowing it hid earlier turns, so the model repeated
+# work it had already done ("the context sticks and doesn't evolve"). Only the
+# server-tool exchanges THIS loop appends are windowed — that is where
+# unbounded growth came from.
 _MODEL_WINDOW = 6
 # Cap for a single tool result replayed into the model context.
 _MODEL_RESULT_CAP = 4000
 
 
-def _windowed_model_messages(prompt_messages: list) -> list:
-    """System prefix + task frame + recent activity (token economy).
+def _text_of(message) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content or "")
 
-    Leading ``SystemMessage`` frames (persona, memory block) always stay;
-    the first non-system message is the task and is preserved; the newest
-    messages carry the latest tool results. The middle of long loops is
-    dropped for the model — the run record keeps the full history.
+
+def _context_summary(messages: list) -> str:
+    """Compact, hashable description of a model context (telemetry).
+
+    The hash makes context drift — or a context that stops evolving across
+    turns — visible in the logs at a glance.
     """
-    prefix_end = 0
-    for message in prompt_messages:
-        if isinstance(message, SystemMessage):
-            prefix_end += 1
-        else:
-            break
-    prefix = prompt_messages[:prefix_end]
-    rest = prompt_messages[prefix_end:]
-    if len(rest) <= _MODEL_WINDOW:
+    roles = [getattr(message, "type", "?") for message in messages]
+    total = sum(len(_text_of(message)) for message in messages)
+    blob = "".join(
+        f"{role}\x1f{_text_of(message)}\x1e" for role, message in zip(roles, messages)
+    )
+    digest = hashlib.sha256(blob.encode()).hexdigest()[:12]
+    return (
+        f"{len(messages)} messages / {total} chars / "
+        f"tail={','.join(roles[-4:]) or '-'} / sha={digest}"
+    )
+
+
+def _bounded_loop_tail(growth: list, limit: int = _MODEL_WINDOW) -> list:
+    """Most recent loop growth, trimmed to a complete tool-call boundary.
+
+    A windowed tail must never begin with an orphan tool result: the upstream
+    gateway rejects function-call outputs with no matching call.
+    """
+    if len(growth) <= limit:
+        return list(growth)
+    tail = list(growth[-limit:])
+    while tail and not getattr(tail[0], "tool_calls", None):
+        tail = tail[1:]
+    if not tail:
+        # Degenerate growth (no call in the tail): keep the last exchange
+        # whole rather than dropping the newest result.
+        return list(growth[-2:])
+    return tail
+
+
+def _loop_model_messages(prompt_messages: list, base_len: int) -> list:
+    """Full harness transcript + a bounded tail of this loop's own growth."""
+    if len(prompt_messages) <= base_len:
         return list(prompt_messages)
-    return prefix + [rest[0]] + rest[-(_MODEL_WINDOW - 1):]
+    return list(prompt_messages[:base_len]) + _bounded_loop_tail(
+        prompt_messages[base_len:]
+    )
 
 
 def _cap_model_result(text: str) -> str:
@@ -183,6 +223,10 @@ async def generate_response(state: AgentState) -> dict:
     tokens_in = 0
     tokens_out = 0
     server_log: list[dict] = []
+    # Everything at or before this point is the harness transcript (sent in
+    # full every call); only growth appended below is windowed.
+    base_len = len(prompt_messages)
+    logger.info("model context (harness): %s", _context_summary(prompt_messages))
 
     # Deterministic research routing: intent analysis classified this turn as
     # research (current/multi-source/verifiable information needed), so
@@ -222,10 +266,14 @@ async def generate_response(state: AgentState) -> dict:
                 f"({len(str(digest or ''))} chars digest)",
             )
 
-    for _ in range(_SERVER_ITERATION_LIMIT):
+    for iteration in range(_SERVER_ITERATION_LIMIT):
+        model_messages = _loop_model_messages(prompt_messages, base_len)
+        logger.info(
+            "model call %d context: %s", iteration + 1, _context_summary(model_messages)
+        )
         try:
             result = await client.acomplete(
-                _windowed_model_messages(prompt_messages),
+                model_messages,
                 tools=tools,
                 tool_choice=tool_choice,
             )

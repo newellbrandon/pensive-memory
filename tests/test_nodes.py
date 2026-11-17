@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from admin import service as admin
 from agent import nodes
@@ -439,40 +439,72 @@ class SpawnPromptConvergenceTest(unittest.TestCase):
 
 
 class ModelWindowTest(SpawnSubagentTest):
-    """The generate loop must not retransmit the full transcript either."""
+    """The client transcript is the harness contract: it must always reach the
+    model IN FULL. Windowing applies only to the server-tool exchanges the
+    generate loop itself appends (windowing the transcript hid earlier turns
+    and made the model repeat work — 'the context sticks')."""
 
-    def _messages(self, count):
-        return [SystemMessage(content="persona")] + [
-            HumanMessage(content=f"msg {i}") for i in range(count)
-        ]
+    def _harness(self, count):
+        return [HumanMessage(content=f"turn {i}") for i in range(count)]
 
-    def test_window_keeps_system_prefix_task_and_recent(self):
-        msgs = self._messages(20)
-        windowed = nodes._windowed_model_messages(msgs)
-        # Persona frame sits ABOVE the window; the conversation slice is
-        # bounded at _MODEL_WINDOW messages.
-        self.assertEqual(len(windowed), 1 + nodes._MODEL_WINDOW)
-        self.assertIsInstance(windowed[0], SystemMessage)  # persona preserved
-        self.assertEqual(windowed[1].content, "msg 0")      # task preserved
-        self.assertEqual(windowed[-1].content, "msg 19")   # newest preserved
-        self.assertNotIn("msg 10", [m.content for m in windowed])
+    def _growth(self, pairs):
+        growth = []
+        for i in range(pairs):
+            growth.append(
+                AIMessage(content="", tool_calls=[{"id": f"c{i}", "name": "glean_search", "args": {}}])
+            )
+            growth.append(ToolMessage(content=f"result {i}", tool_call_id=f"c{i}"))
+        return growth
 
-    def test_window_returns_short_transcript_unchanged(self):
-        msgs = self._messages(5)
-        self.assertEqual(nodes._windowed_model_messages(msgs), msgs)
+    def test_loop_messages_keep_full_harness_transcript(self):
+        harness = self._harness(20)
+        growth = self._growth(4)
+        msgs = nodes._loop_model_messages(harness + growth, len(harness))
+        for message in harness:
+            self.assertIn(message, msgs)
+        self.assertLessEqual(len(msgs), len(harness) + nodes._MODEL_WINDOW)
+
+    def test_first_call_sends_full_transcript(self):
+        harness = self._harness(12)
+        self.assertEqual(nodes._loop_model_messages(harness, len(harness)), harness)
+
+    def test_loop_tail_starts_at_a_tool_call_boundary(self):
+        # A windowed tail must not begin with an orphan tool result — the
+        # upstream gateway rejects outputs with no matching call.
+        harness = self._harness(1)
+        growth = self._growth(5)
+        msgs = nodes._loop_model_messages(harness + growth, 1)
+        first_growth = msgs[len(harness)]
+        self.assertTrue(getattr(first_growth, "tool_calls", None))
 
     def test_server_tool_digests_capped_before_replay(self):
         self.assertEqual(len(nodes._cap_model_result("x" * 99999)), 4000)
         self.assertEqual(nodes._cap_model_result("short"), "short")
 
-    def test_generate_loop_sends_windowed_messages_per_step(self):
-        # A model that keeps calling server tools must see a bounded context
-        # every round — full-history resends are what blew up input tokens.
+    def test_generate_loop_keeps_full_client_transcript(self):
+        # End to end through the node: a 14-message client transcript must be
+        # fully present in EVERY model call, not just the first.
+        transcript = [HumanMessage(content=f"m{i}") for i in range(14)]
         call = {"id": "g1", "name": "glean_search", "arguments": json.dumps({"query": "q"})}
-        steps = [{"text": "", "tool_calls": [call]} for _ in range(5)]
-        steps.append({"text": "done", "tool_calls": []})
+        steps = [{"text": "", "tool_calls": [call]}, {"text": "", "tool_calls": [call]}, {"text": "done"}]
+        state = _state()
+        state["prompt_messages"] = transcript
+        state["messages"] = [transcript[-1]]
         graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        result, client = self.run_node(_state(), steps, graph=graph)
+        result, client = self.run_node(state, steps, graph=graph)
         self.assertEqual(result["response"], "done")
         for recorded in client.calls:
-            self.assertLessEqual(len(recorded["messages"]), 1 + nodes._MODEL_WINDOW)
+            sent = recorded["messages"]
+            for message in transcript:
+                self.assertIn(message, sent)
+
+    def test_context_summary_reports_size_and_stable_hash(self):
+        from langchain_core.messages import ToolMessage as TM
+
+        msgs = [HumanMessage(content="hello"), TM(content="world", tool_call_id="c1")]
+        summary = nodes._context_summary(msgs)
+        self.assertIn("2 messages", summary)
+        self.assertIn("sha=", summary)
+        # Identical context -> identical hash (so "sticking" is visible in logs)
+        self.assertEqual(summary, nodes._context_summary(list(msgs)))
+        self.assertNotEqual(summary, nodes._context_summary([HumanMessage(content="different")]))
