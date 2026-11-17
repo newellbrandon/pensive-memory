@@ -195,7 +195,7 @@ async def generate_response(state: AgentState) -> dict:
     back to the client in the response.
 
     When ``offer_server_tools`` is set (main-context chats only), the model is
-    also offered ``spawn_subagent`` (delegate to an isolated subagent with its
+    also offered ``pensive_subagent`` (delegate to an isolated subagent with its
     own memory scope, workspace, and tools) and the read-only project tools
     (``project_list`` / ``project_read`` over the host projects directory,
     including the OKF bundle). server-executed results are fed back to the
@@ -204,6 +204,7 @@ async def generate_response(state: AgentState) -> dict:
     """
     query = _latest_user_message(state)
     memory_context = state.get("memory_context") or []
+    offer_server = bool(state.get("offer_server_tools"))
 
     # Honoring the full request transcript (harness context) is what lets this
     # act as an OpenCode coding model: the client's system prompt, tool results,
@@ -215,10 +216,15 @@ async def generate_response(state: AgentState) -> dict:
     if system_prompt:
         prompt_messages.append(SystemMessage(content=system_prompt))
     prompt_messages.extend(_memory_messages(memory_context))
+    if offer_server:
+        # Disambiguate Pensive's own delegation tool from a client harness's
+        # `subagent` tool (only present when the client offers one).
+        note = _subagent_disambiguation(state.get("tools"))
+        if note:
+            prompt_messages.append(SystemMessage(content=note))
     prompt_messages.extend(transcript)
 
     client = get_responses_client()
-    offer_server = bool(state.get("offer_server_tools"))
     if offer_server:
         # Warm the Glean tool snapshot (cheap: once per minute; no-op when the
         # deployment is not connected) so glean_* schemas reach the model.
@@ -274,7 +280,7 @@ async def generate_response(state: AgentState) -> dict:
                 )
             )
             _emit_decision(
-                "spawn_subagent",
+                "pensive_subagent",
                 "ok",
                 f"research turn auto-delegated to a subagent "
                 f"({len(str(digest or ''))} chars digest)",
@@ -353,7 +359,7 @@ async def generate_response(state: AgentState) -> dict:
                 ToolMessage(
                     content=(
                         "[error] server tool budget exhausted: at most 2 "
-                        "spawn_subagent and 8 server tool calls per turn; "
+                        "pensive_subagent and 8 server tool calls per turn; "
                         "combine tasks or finish with what you have."
                     ),
                     tool_call_id=call.get("id") or "",
@@ -389,7 +395,10 @@ def _call_name(call: dict) -> str:
     return str(call.get("name") or "")
 
 
-SPAWN_SUBAGENT_NAME = "spawn_subagent"
+SPAWN_SUBAGENT_NAME = "pensive_subagent"
+# A coding harness (e.g. OpenCode) may offer its own tool with this exact name;
+# Pensive relays those calls back to the client instead of executing them.
+CLIENT_SUBAGENT_TOOL = "subagent"
 _SPAWN_BUDGET = 2
 _SERVER_TOOL_BUDGET = 8
 # More LLM rounds than the server-tool budget, so a model that pages through
@@ -417,14 +426,17 @@ SPAWN_SUBAGENT_TOOL: dict = {
     "function": {
         "name": SPAWN_SUBAGENT_NAME,
         "description": (
-            "Delegate a self-contained task to an isolated subagent. The subagent "
-            "gets its own memory scope, workspace, and tools (file editing, shell, "
-            "web search) so this conversation stays clean; only a short digest of "
-            "its final answer returns. Pass tools: [] for the defaults. At most 2 "
-            "spawns per turn. USE THIS for open-ended research and verification "
-            "tasks that need current, multi-source, or verifiable information "
-            "(research questions, deep dives, comparisons, fact-checking) — do "
-            "not answer such research tasks from memory alone."
+            "Pensive's own delegation tool: run a self-contained task in an "
+            "isolated subagent that has its own memory scope, workspace, and "
+            "tools (file editing, shell, web search) so this conversation stays "
+            "clean; only a short digest of its final answer returns. Pass "
+            "tools: [] for the defaults. At most 2 calls per turn. USE THIS for "
+            "open-ended research and verification tasks that need current, "
+            "multi-source, or verifiable information (research questions, deep "
+            "dives, comparisons, fact-checking) — do not answer such research "
+            "tasks from memory alone. If the client also offers a tool named "
+            "'subagent', that is the client harness's own tool; use "
+            "pensive_subagent to delegate inside Pensive."
         ),
         "parameters": {
             "type": "object",
@@ -452,6 +464,32 @@ def _named_tool(name: str) -> dict:
 
 PROJECT_LIST_TOOL = _named_tool("project_list")
 PROJECT_READ_TOOL = _named_tool("project_read")
+
+
+def _client_tool_names(client_tools: list[dict] | None) -> set[str]:
+    return {
+        str((t.get("function") or {}).get("name") or t.get("name") or "")
+        for t in (client_tools or [])
+        if isinstance(t, dict)
+    }
+
+
+def _subagent_disambiguation(client_tools: list[dict] | None) -> str:
+    """Reminder added only when the client offers its own ``subagent`` tool.
+
+    Without it the model reads "spawn a subagent" as the client's tool (whose
+    calls Pensive relays back to the harness) instead of Pensive's own
+    server-side delegation.
+    """
+    if CLIENT_SUBAGENT_TOOL not in _client_tool_names(client_tools):
+        return ""
+    return (
+        f"This client offers its own `{CLIENT_SUBAGENT_TOOL}` tool — a child "
+        f"session in the client harness. Pensive's own delegation tool is "
+        f"`{SPAWN_SUBAGENT_NAME}`: use it when you want Pensive to run an "
+        f"isolated subagent (its own workspace, web search, document and Glean "
+        f"tools) and return a digest."
+    )
 
 
 def _server_tools(client_tools: list[dict] | None, offer_server: bool) -> list[dict]:
@@ -507,7 +545,7 @@ async def _execute_server_call(call: dict, state: AgentState) -> str:
 
 
 async def _execute_spawn(call: dict, state: AgentState) -> str:
-    """Run one spawn_subagent call; returns the digest fed back to the model."""
+    """Run one pensive_subagent call; returns the digest fed back to the model."""
     # Imported here to avoid the agent.graph <-> agent.nodes import cycle.
     from agent.graph import active_graph
 
@@ -517,13 +555,13 @@ async def _execute_spawn(call: dict, state: AgentState) -> str:
             args = {}
     except (ValueError, TypeError):
         return (
-            "[error] spawn_subagent arguments are not valid JSON; reissue the "
+            "[error] pensive_subagent arguments are not valid JSON; reissue the "
             "call with valid JSON (task is a string, tools optional)."
         )
 
     task = str(args.get("task") or "").strip()
     if not task:
-        return "[error] spawn_subagent requires a non-empty 'task' string"
+        return "[error] pensive_subagent requires a non-empty 'task' string"
     graph = active_graph()
     if graph is None:
         return "[error] subagent execution unavailable: the graph is not ready"
@@ -569,7 +607,7 @@ async def _execute_spawn(call: dict, state: AgentState) -> str:
         for c in calls
     )
     _emit_decision(
-        "spawn_subagent",
+        "pensive_subagent",
         "ok",
         f"subagent {agent_id} finished: {len(calls)} tool call(s), "
         f"answer {len(answer)} chars",

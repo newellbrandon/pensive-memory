@@ -23,7 +23,7 @@ flowchart TD
   lg -.->|"MongoDBSaver · every superstep"| checkpoints["checkpoints<br/>checkpoint_writes"]
   lg -->|"Memory.record_turn · Memory.build_context (SDK)"| memsvc[("Atlas Agent Engine<br/>memory service")]
 
-  lg -.->|"spawn_subagent · digest only"| sub["Isolated subagent<br/>memory agent:sub-* · own workspace"]
+  lg -.->|"pensive_subagent · digest only"| sub["Isolated subagent<br/>memory agent:sub-* · own workspace"]
   sub -->|"runs the same graph"| lg
   lg -.->|"glean_* tools · MCP + OAuth2"| glean[("Glean enterprise search")]
   lg -.->|"project_list / project_read"| projects[("~/projects · read-only")]
@@ -40,7 +40,7 @@ flowchart TD
 
 ### LangGraph workflow
 
-Every chat message — and every agent-lab/subagent run — runs the four nodes below. The graph also carries a **server-tool loop inside `generate_response`** (offered only in main-context chats): the model may delegate via `spawn_subagent`, browse host projects (`project_list` / `project_read`), or call the discovered Glean tools (`glean_*`); results are executed server-side and fed back until the model produces a final answer. OpenWebUI streams the **decision** from each step before the final answer — the second line in each node label matches what you see in the demo screenshots.
+Every chat message — and every agent-lab/subagent run — runs the four nodes below. The graph also carries a **server-tool loop inside `generate_response`** (offered only in main-context chats): the model may delegate via `pensive_subagent`, browse host projects (`project_list` / `project_read`), or call the discovered Glean tools (`glean_*`); results are executed server-side and fed back until the model produces a final answer. OpenWebUI streams the **decision** from each step before the final answer — the second line in each node label matches what you see in the demo screenshots.
 
 The checkpointer persists graph state after every superstep (not only these four nodes), which is why a single message produces multiple `checkpoints` and `checkpoint_writes` documents.
 
@@ -55,7 +55,7 @@ flowchart TD
   search --> generate
 
   generate -.->|"OpenAI Responses API"| llmNode[["LLM"]]
-  generate -.->|"server-tool loop: spawn_subagent · project_* · glean_*"| serverTools["server tools<br/>budgeted · results fed back"]
+  generate -.->|"server-tool loop: pensive_subagent · project_* · glean_*"| serverTools["server tools<br/>budgeted · results fed back"]
   generate --> save["save_memory<br/>Save Memory"]
 
   save -->|"Memory.record_turn (user + assistant)"| memsvc
@@ -99,12 +99,16 @@ while providing persistent memory for important context:
   facts in the background; each turn's prompt is grounded with `build_context`
   over those facts, so they carry across sessions, chats, and workflows.
 - **Subagent delegation keeps the primary context clean.** Main-context chats are
-  offered a server-side `spawn_subagent` tool: the model can delegate a
+  offered a server-side `pensive_subagent` tool: the model can delegate a
   self-contained task (research, builds, long tool chains) to an isolated
   subagent with its own memory scope (`agent:sub-…`), workspace, and tools. Only
   a short digest of the subagent's final answer returns to the conversation (at
-  most 2 spawns per turn, no nesting — subagents never see the spawn tool).
-  Full artifacts land in the subagent's workspace and run history.
+  most 2 calls per turn, no nesting — subagents never see the delegation tool).
+  Full artifacts land in the subagent's workspace and run history. The tool is
+  named `pensive_subagent` on purpose: a coding harness (e.g. OpenCode) may offer
+  its **own** `subagent` tool, whose calls Pensive relays back to the client. When
+  a client offers one, Pensive adds a one-line system reminder so the model uses
+  `pensive_subagent` for in-Pensive delegation.
 - **Read access to your projects (incl. the OKF bundle).** The host's
   `~/projects` directory (or `PROJECTS_HOST_DIR`) is mounted read-only into the
   container at `/projects`, and main-context chats plus all agents get

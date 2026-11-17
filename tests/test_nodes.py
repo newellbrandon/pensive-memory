@@ -1,4 +1,4 @@
-"""Tests for generate_response's server-side spawn_subagent loop."""
+"""Tests for generate_response's server-side pensive_subagent loop."""
 from __future__ import annotations
 
 import asyncio
@@ -80,7 +80,7 @@ class _BoomGraph:
 
 def _spawn_call(call_id, task, **extra):
     args = {"task": task, **extra}
-    return {"id": call_id, "name": "spawn_subagent", "arguments": json.dumps(args)}
+    return {"id": call_id, "name": "pensive_subagent", "arguments": json.dumps(args)}
 
 
 class SpawnSubagentTest(unittest.TestCase):
@@ -128,7 +128,7 @@ class SpawnSubagentTest(unittest.TestCase):
     def test_server_tool_offered_when_flag_on(self):
         result, client = self.run_node(_state(), [{"text": "ok"}])
         names = self.tool_names(client)
-        self.assertIn("spawn_subagent", names)
+        self.assertIn("pensive_subagent", names)
         self.assertIn("project_list", names)
         self.assertIn("project_read", names)
         self.assertEqual(result["response"], "ok")
@@ -138,7 +138,7 @@ class SpawnSubagentTest(unittest.TestCase):
         client_tool = {"type": "function", "function": {"name": "edit", "description": "d"}}
         result, client = self.run_node(_state(offer=False, tools=[client_tool]), [{"text": "ok"}])
         names = self.tool_names(client)
-        self.assertNotIn("spawn_subagent", names)
+        self.assertNotIn("pensive_subagent", names)
         self.assertNotIn("project_list", names)
         self.assertIn("edit", names)
 
@@ -187,7 +187,7 @@ class SpawnSubagentTest(unittest.TestCase):
             result, client = self.run_node(_state(), [{"text": "ok"}])
         names = self.tool_names(client)
         self.assertIn("glean_search", names)
-        self.assertIn("spawn_subagent", names)
+        self.assertIn("pensive_subagent", names)
         self.assertEqual(result["response"], "ok")
 
     def test_glean_tool_executed_and_result_fed_back(self):
@@ -247,7 +247,7 @@ class SpawnSubagentTest(unittest.TestCase):
         result, client = self.run_node(_state(), steps, graph=graph)
         log = result.get("server_tool_log") or []
         self.assertEqual(len(log), 1)
-        self.assertEqual(log[0]["name"], "spawn_subagent")
+        self.assertEqual(log[0]["name"], "pensive_subagent")
         self.assertIn("[ok] subagent", log[0]["output"])
         self.assertIn("arguments", log[0])
 
@@ -300,7 +300,7 @@ class SpawnSubagentTest(unittest.TestCase):
         self.assertTrue(any("[ok] subagent" in m.content for m in tool_msgs))
         self.assertTrue(any("HNSW is the index" in m.content for m in tool_msgs))
         # decision streamed for the UI
-        self.assertTrue(any(d[0] == "spawn_subagent" and d[1] == "ok" for d in self.decisions))
+        self.assertTrue(any(d[0] == "pensive_subagent" and d[1] == "ok" for d in self.decisions))
         # run history recorded under the ephemeral subagent id
         self.assertEqual(len(self.recorded_runs), 1)
         self.assertTrue(self.recorded_runs[0][0].startswith("sub-"))
@@ -334,7 +334,7 @@ class SpawnSubagentTest(unittest.TestCase):
 
     def test_missing_task_returns_error_result(self):
         graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        call = {"id": "s1", "name": "spawn_subagent", "arguments": "{}"}
+        call = {"id": "s1", "name": "pensive_subagent", "arguments": "{}"}
         steps = [{"text": "", "tool_calls": [call]}, {"text": "done"}]
         result, client = self.run_node(_state(), steps, graph=graph)
         self.assertEqual(result["response"], "done")
@@ -357,10 +357,62 @@ class SpawnSubagentTest(unittest.TestCase):
 class SpawnToolDefinitionTest(unittest.TestCase):
     def test_spawn_description_guides_research_delegation(self):
         # The model must recognize open-ended research as a delegation case:
-        # research tasks need spawn_subagent, not a memory-only answer.
+        # research tasks need pensive_subagent, not a memory-only answer.
         description = nodes.SPAWN_SUBAGENT_TOOL["function"]["description"].lower()
         self.assertIn("research", description)
         self.assertIn("open-ended", description)
+
+    def test_tool_name_is_namespaced_for_pensive(self):
+        # The tool must NOT be called "subagent": a coding harness (e.g. OpenCode)
+        # offers its own `subagent` tool, and the exact-name clash made the model
+        # delegate to the harness instead of Pensive.
+        self.assertEqual(nodes.SPAWN_SUBAGENT_NAME, "pensive_subagent")
+        self.assertEqual(
+            nodes.SPAWN_SUBAGENT_TOOL["function"]["name"], "pensive_subagent"
+        )
+
+    def test_description_disambiguates_from_client_subagent(self):
+        description = nodes.SPAWN_SUBAGENT_TOOL["function"]["description"].lower()
+        # It names the harness tool and says this one is Pensive's own.
+        self.assertIn("subagent", description)
+        self.assertIn("pensive", description)
+
+
+class SubagentDisambiguationTest(SpawnSubagentTest):
+    """When the client harness offers its own `subagent` tool, Pensive adds a
+    one-line system reminder so the model delegates inside Pensive."""
+
+    CLIENT_SUBAGENT = {
+        "type": "function",
+        "function": {
+            "name": "subagent",
+            "description": "Spawns an agent in a child session.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    def _system_text(self, client):
+        messages = client.calls[0]["messages"]
+        return "\n".join(
+            str(getattr(m, "content", ""))
+            for m in messages
+            if isinstance(m, SystemMessage)
+        )
+
+    def test_disambiguation_added_when_client_offers_subagent(self):
+        _, client = self.run_node(
+            _state(tools=[self.CLIENT_SUBAGENT]), [{"text": "ok"}]
+        )
+        text = self._system_text(client)
+        self.assertIn("pensive_subagent", text)
+        self.assertIn("subagent", text)
+        # Pensive's own tool is still offered alongside the client's.
+        self.assertIn("pensive_subagent", self.tool_names(client))
+        self.assertIn("subagent", self.tool_names(client))
+
+    def test_no_disambiguation_without_client_subagent(self):
+        _, client = self.run_node(_state(tools=[]), [{"text": "ok"}])
+        self.assertNotIn("pensive_subagent", self._system_text(client))
 
 
 class ResearchDelegationTest(SpawnSubagentTest):
@@ -418,7 +470,7 @@ class ResearchDelegationTest(SpawnSubagentTest):
         self.assertTrue(any("SUBAGENT ANSWER" in m.content for m in tool_msgs))
         self.assertEqual(result["response"], "Answer grounded in research")
         self.assertIn(
-            ("spawn_subagent", "ok"), [(s, d) for s, d, _ in self.decisions]
+            ("pensive_subagent", "ok"), [(s, d) for s, d, _ in self.decisions]
         )
 
     def test_no_research_flag_no_auto_spawn(self):

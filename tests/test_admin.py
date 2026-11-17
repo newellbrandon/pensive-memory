@@ -103,10 +103,10 @@ class SystemPromptTest(unittest.TestCase):
         self.assertEqual(admin.get_system_prompt(collection=coll), Config.SYSTEM_PROMPT)
 
     def test_default_prompt_instructs_research_delegation(self):
-        # Open-ended research must be delegated to spawn_subagent, and the
+        # Open-ended research must be delegated to pensive_subagent, and the
         # model must never claim tool/source use that didn't happen.
         prompt = Config.SYSTEM_PROMPT.lower()
-        self.assertIn("spawn_subagent", prompt)
+        self.assertIn("pensive_subagent", prompt)
         self.assertIn("research", prompt)
         self.assertIn("open-ended", prompt)
         self.assertIn("never claim", prompt)
@@ -127,7 +127,7 @@ class SystemPromptTest(unittest.TestCase):
         # file: no fabricated uploads, no invented paths.
         prompt = Config.SYSTEM_PROMPT.lower()
         self.assertIn("no ability to save files", prompt)
-        self.assertIn("spawn_subagent", prompt)
+        self.assertIn("pensive_subagent", prompt)
 
 
 class MemoryCurationTest(unittest.TestCase):

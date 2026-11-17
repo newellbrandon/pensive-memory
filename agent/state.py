@@ -28,7 +28,7 @@ class AgentState(TypedDict):
     tools: list[dict]
     tool_choice: object | None
     tool_calls: list[dict]
-    # Server-side capabilities: when true, the model may call spawn_subagent
+    # Server-side capabilities: when true, the model may call pensive_subagent
     # and the project browsing tools (never offered to subagents).
     offer_server_tools: bool
     # Full incoming request transcript for this turn (harness context). Kept
