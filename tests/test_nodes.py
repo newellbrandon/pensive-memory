@@ -620,17 +620,24 @@ class AgentEngineMemoryNodeTest(unittest.TestCase):
 
     def test_generate_injects_memory_context_as_messages(self):
         state = _state(offer=False)
-        state["memory_context"] = [{"role": "system", "content": "Brandon prefers Glean."}]
+        state["memory_context"] = [
+            {
+                "text": "Brandon prefers Glean.",
+                "source": "semantic",
+                "recorded_at": "2026-11-13T18:46:07.978116+00:00",
+            }
+        ]
         with mock.patch("agent.nodes.get_responses_client") as get_client:
             get_client.return_value = _FakeClient([{"text": "ok"}])
             _run(nodes.generate_response(state))
         sent = get_client.return_value.calls[0]["messages"]
-        self.assertTrue(
-            any(
-                isinstance(m, SystemMessage) and "Brandon prefers Glean." in m.content
-                for m in sent
-            )
+        block = next(
+            m.content for m in sent
+            if isinstance(m, SystemMessage) and "Brandon prefers Glean." in m.content
         )
+        # The real ISO date must reach the model so it can reason about time.
+        self.assertIn("2026-11-13T18:46:07.978116+00:00", block)
+        self.assertIn("semantic", block)
 
     def test_generate_without_memory_injects_nothing_extra(self):
         state = _state(offer=False)
@@ -640,3 +647,32 @@ class AgentEngineMemoryNodeTest(unittest.TestCase):
             _run(nodes.generate_response(state))
         sent = get_client.return_value.calls[0]["messages"]
         self.assertEqual([m for m in sent if isinstance(m, SystemMessage)], [])
+
+
+class MemoryBlockTest(unittest.TestCase):
+    """The injected memory block is dated ISO 8601, newest first, so the model
+    can reason about when things happened (the service's own timestamp is the
+    write time, wrong for migrated memories)."""
+
+    def test_renders_iso_dates_newest_first(self):
+        records = [
+            {"text": "old", "source": "semantic", "recorded_at": "2026-11-01T09:00:00+00:00"},
+            {"text": "new", "source": "episodic", "recorded_at": "2026-11-13T18:46:07.978116+00:00"},
+            {"text": "undated", "source": "semantic", "recorded_at": None, "timestamp": None},
+        ]
+        block = nodes._memory_messages(records)[0].content
+        lines = [l for l in block.splitlines() if l.startswith("- ")]
+        self.assertEqual(lines, [
+            "- [2026-11-13T18:46:07.978116+00:00, episodic] new",
+            "- [2026-11-01T09:00:00+00:00, semantic] old",
+            "- [date unknown, semantic] undated",
+        ])
+
+    def test_falls_back_to_service_timestamp_when_no_recorded_at(self):
+        records = [{"text": "fresh", "source": "semantic", "recorded_at": None,
+                    "timestamp": "2026-11-17T22:16:54.827000"}]
+        block = nodes._memory_messages(records)[0].content
+        self.assertIn("[2026-11-17T22:16:54.827000, semantic] fresh", block)
+
+    def test_empty_when_no_records(self):
+        self.assertEqual(nodes._memory_messages([]), [])

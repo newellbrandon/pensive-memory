@@ -165,13 +165,16 @@ class MemoryCurationTest(unittest.TestCase):
     def test_list_memories_browses_via_the_adapter(self):
         hits = [
             {"text": "Brandon", "source": "semantic", "label": "name",
-             "id": "m1", "similarity_score": None, "timestamp": "2026-11-01T10:00:00"}
+             "id": "m1", "similarity_score": None, "timestamp": "2026-11-17T22:16:54.827000",
+             "recorded_at": "2026-11-13T18:51:14.122559+00:00"}
         ]
         with mock.patch.object(admin.agent_engine, "list_memories", return_value=hits) as lst:
             rows = admin.list_memories("u1")
         self.assertEqual(rows[0]["content"], "Brandon")
         self.assertEqual(rows[0]["type"], "semantic")
-        self.assertEqual(rows[0]["updated_at"], "2026-11-01T10:00:00")
+        # The REAL date is surfaced (not the service's write-time timestamp).
+        self.assertEqual(rows[0]["recorded_at"], "2026-11-13T18:51:14.122559+00:00")
+        self.assertEqual(rows[0]["updated_at"], "2026-11-17T22:16:54.827000")
         self.assertEqual(lst.call_args.args, ("u1", None))
 
     def test_memory_counts_counts_result_set_by_type(self):

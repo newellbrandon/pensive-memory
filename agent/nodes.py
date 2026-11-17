@@ -30,21 +30,42 @@ def _latest_user_message(state: AgentState) -> str:
     return memories.latest_user_text(state["messages"])
 
 
-def _memory_messages(memory_context: list[dict]) -> list:
-    """Render Agent Engine context as ONE injected system block.
+def _iso_date(value) -> str:
+    """The real date as ISO 8601, or 'date unknown'."""
+    if not value:
+        return "date unknown"
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
-    The service returns role-tagged messages, but for a harness backend memory
-    is background context, not the user's words: folding it into a single
-    system message keeps it from masquerading as a real turn in the transcript.
+
+def _memory_messages(memory_context: list[dict]) -> list:
+    """Render retrieved memory as ONE dated system block (newest first).
+
+    Memory is background context, not the user's words, so it is folded into a
+    single system message. Each fact carries its REAL ISO 8601 date (the
+    migration preserved original dates in metadata) so the model can reason
+    about when things happened.
     """
-    parts = [
-        str(item.get("content"))
-        for item in (memory_context or [])
-        if isinstance(item, dict) and item.get("content")
+    records = [
+        record
+        for record in (memory_context or [])
+        if isinstance(record, dict) and str(record.get("text") or "").strip()
     ]
-    if not parts:
+    if not records:
         return []
-    return [SystemMessage(content="\n".join(parts))]
+    records.sort(
+        key=lambda r: str(r.get("recorded_at") or r.get("timestamp") or ""),
+        reverse=True,
+    )
+    lines = [
+        "Relevant long-term memory about this user, newest first "
+        "(retrieved automatically; the user did not ask for it):"
+    ]
+    for record in records:
+        when = _iso_date(record.get("recorded_at") or record.get("timestamp"))
+        lines.append(f"- [{when}, {record.get('source') or 'memory'}] {record['text']}")
+    return [SystemMessage(content="\n".join(lines))]
 
 
 # Model context budget. The client transcript is the HARNESS CONTRACT and is

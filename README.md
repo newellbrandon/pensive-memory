@@ -226,9 +226,12 @@ service; everything else calls it:
    and returns the context. **STM is deliberately excluded**: the harness
    transcript already carries the current conversation, so re-injecting recent
    turns would duplicate it.
-3. **Generation** — the memory context is folded into one injected system block
-   (background context, never a fake user/assistant turn) and personalized into
-   the reply.
+3. **Generation** — the retrieved facts are folded into ONE injected system
+   block (background context, never a fake user/assistant turn), each line
+   carrying its **real ISO 8601 date** (`- [2026-11-13T18:46:07.978116+00:00,
+   episodic] …`, newest first) so the model can reason about *when* things
+   happened. The service's own `timestamp` is the write time, so Pensive prefers
+   the original `recorded_at` (preserved in metadata for migrated memories).
 4. **Write-back** (`save_memory`) — `Memory.record_turn` appends the user and
    assistant turns (idempotency-keyed, so a retried request never double-records).
    The service extracts durable facts from those turns **in the background**, so
@@ -275,6 +278,11 @@ names, which the service validates), and records every migrated key in a
 create-only, so without the ledger a re-run would duplicate episodes, taxonomic
 terms, and procedures. The legacy collection is never modified. Use `--user` /
 `--type` to narrow the scope.
+
+**Dates are preserved.** The service stamps every write with its own time and
+accepts no timestamp, so each migrated memory keeps its original `recorded_at`
+(ISO 8601) in custom metadata. Pensive reads that back and renders it — in the
+prompt's memory block and in the Console — so temporal reasoning still works.
 
 ### Memory pays off on repeat work (tokens, tools, runtime)
 

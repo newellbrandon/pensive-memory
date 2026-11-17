@@ -136,6 +136,37 @@ def normalize_context(formatted: Any) -> list[dict]:
     return messages
 
 
+def _recorded_at(metadata: Any) -> str | None:
+    """The memory's REAL date, ISO 8601.
+
+    Migrated memories carry their original date in custom metadata because the
+    service stamps its own write time and cannot be told otherwise. Custom
+    metadata is nested under ``metadata`` on search chunks and flat on list
+    entries, so both shapes are checked.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    nested = metadata.get("metadata")
+    if isinstance(nested, dict) and nested.get("recorded_at"):
+        return str(nested["recorded_at"])
+    if metadata.get("recorded_at"):
+        return str(metadata["recorded_at"])
+    return None
+
+
+def _chunk_record(chunk: Any) -> dict:
+    """A selected memory chunk as a dated record for the prompt."""
+    metadata = getattr(chunk, "metadata", None) or {}
+    source = getattr(chunk, "source", None)
+    timestamp = getattr(chunk, "timestamp", None)
+    return {
+        "text": str(getattr(chunk, "content", "") or ""),
+        "source": str(getattr(source, "value", source) or "memory"),
+        "recorded_at": _recorded_at(metadata),
+        "timestamp": str(timestamp) if timestamp else None,
+    }
+
+
 def build_context(
     user_id: str,
     session_id: str,
@@ -144,7 +175,13 @@ def build_context(
     max_tokens: int | None = None,
     sources: Sequence[str] | None = None,
 ) -> list[dict]:
-    """Assemble long-term memory context for a query (list of message dicts)."""
+    """Retrieve long-term memory for the prompt as dated records.
+
+    The service ranks, de-duplicates and token-budgets the selection
+    (``build_context``); Pensive then renders the block itself so each fact
+    carries its REAL ISO 8601 date — the service's own ``timestamp`` is the
+    write time, which for migrated memories is not when the fact happened.
+    """
     if not str(query or "").strip():
         return []
     handle = _bind(user_id, session_id)
@@ -155,13 +192,21 @@ def build_context(
             query=query,
             enabled_sources=set(sources or LONG_TERM_SOURCES),
             max_tokens=max_tokens or Config.AGENTIC_MEMORY_MAX_TOKENS,
+            include_memories=True,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Memory context build failed (%s: %s)", type(exc).__name__, exc
         )
         return []
-    return normalize_context(getattr(response, "formatted_context", None))
+    chunks = getattr(response, "selected_memories", None)
+    if chunks:
+        return [_chunk_record(chunk) for chunk in chunks]
+    # Fallback: the server did not return chunks — keep the content, undated.
+    return [
+        {"text": message["content"], "source": "", "recorded_at": None, "timestamp": None}
+        for message in normalize_context(getattr(response, "formatted_context", None))
+    ]
 
 
 def _hit(chunk: Any) -> dict:
@@ -174,6 +219,7 @@ def _hit(chunk: Any) -> dict:
         "label": str(metadata.get("label") or ""),
         "id": str(getattr(chunk, "id", "") or ""),
         "similarity_score": getattr(chunk, "similarity_score", None),
+        "recorded_at": _recorded_at(metadata),
         "timestamp": str(timestamp) if timestamp else None,
     }
 
@@ -220,6 +266,7 @@ def _entry_hit(entry: dict, kind: str) -> dict:
         "label": str(label),
         "id": str(entry.get("id") or ""),
         "similarity_score": None,
+        "recorded_at": _recorded_at(entry.get("metadata")),
         "timestamp": str(entry.get("timestamp")) if entry.get("timestamp") else None,
     }
 

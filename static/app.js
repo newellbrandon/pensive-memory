@@ -179,12 +179,13 @@ function memoryRow(row) {
   const score =
     row.similarity_score != null ? ` · score ${Number(row.similarity_score).toFixed(2)}` : "";
   const editable = row.type === "semantic";
+  const when = row.recorded_at || row.updated_at;
 
   div.innerHTML = `
     <div class="row-head">
       <span class="badge" style="background:${TYPE_COLORS[row.type] || "#00ed64"}22;color:${TYPE_COLORS[row.type] || "#00ed64"}">${esc(row.type)}</span>
       <span class="label" title="${esc(subtitle)}">${esc(row.label || "")}</span>
-      <span class="when">${fmtWhen(row.updated_at)}${score}</span>
+      <span class="when" title="${row.recorded_at ? "recorded" : "stored"}">${esc(when || "")}${score}</span>
     </div>
     <p class="content">${esc(row.content)}</p>
     ${editable ? '<div class="row-actions"><button class="btn ghost small" data-action="edit">Edit</button></div>' : ""}

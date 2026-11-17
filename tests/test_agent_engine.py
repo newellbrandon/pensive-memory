@@ -27,8 +27,9 @@ class FakeChunk:
 
 
 class FakeContextResponse:
-    def __init__(self, formatted_context):
+    def __init__(self, formatted_context=None, selected_memories=None):
         self.formatted_context = formatted_context
+        self.selected_memories = selected_memories
 
 
 class FakeResult:
@@ -37,9 +38,10 @@ class FakeResult:
 
 
 class FakeHandle:
-    def __init__(self, *, chunks=None, formatted=None, semantic=None, error=None):
+    def __init__(self, *, chunks=None, formatted=None, memories=None, semantic=None, error=None):
         self.chunks = chunks or []
         self.formatted = formatted if formatted is not None else []
+        self.memories = memories
         self.semantic = semantic
         self.error = error
         self.turns: list[dict] = []
@@ -57,7 +59,7 @@ class FakeHandle:
         if self.error:
             raise self.error
         self.context_calls.append(kwargs)
-        return FakeContextResponse(self.formatted)
+        return FakeContextResponse(self.formatted, self.memories)
 
     def search(self, query, **kwargs):
         if self.error:
@@ -134,29 +136,39 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(ae.record_turn("u1", "s1", "assistant", "   "))
         self.assertEqual(handle.turns, [])
 
-    def test_build_context_reads_long_term_only(self):
-        handle = FakeHandle(
-            formatted=[{"role": "system", "content": "Brandon prefers Glean."}]
+    def test_build_context_returns_dated_records_from_selected_memories(self):
+        chunk = FakeChunk(
+            "Brandon prefers Glean.",
+            "semantic",
+            metadata={"metadata": {"recorded_at": "2026-11-13T18:46:07.978116+00:00"}},
         )
+        handle = FakeHandle(memories=[chunk])
         self._install(handle)
-        messages = ae.build_context("u1", "s1", "search tooling", max_tokens=1234)
+        records = ae.build_context("u1", "s1", "search tooling", max_tokens=1234)
         self.assertEqual(
-            messages, [{"role": "system", "content": "Brandon prefers Glean."}]
+            records,
+            [{
+                "text": "Brandon prefers Glean.",
+                "source": "semantic",
+                "recorded_at": "2026-11-13T18:46:07.978116+00:00",
+                "timestamp": None,
+            }],
         )
         call = handle.context_calls[0]
         self.assertEqual(call["query"], "search tooling")
         self.assertEqual(call["max_tokens"], 1234)
+        # Chunks are requested so Pensive can render the REAL date.
+        self.assertTrue(call["include_memories"])
         # STM is excluded: the harness transcript already carries the conversation.
         self.assertNotIn("stm", call["enabled_sources"])
         self.assertEqual(set(call["enabled_sources"]), set(ae.LONG_TERM_SOURCES))
 
-    def test_build_context_accepts_string_formatted_context(self):
-        handle = FakeHandle(formatted="Facts:\n- likes dark mode")
+    def test_build_context_falls_back_to_formatted_context(self):
+        handle = FakeHandle(formatted=[{"role": "system", "content": "Brandon prefers Glean."}])
         self._install(handle)
-        self.assertEqual(
-            ae.build_context("u1", "s1", "q"),
-            [{"role": "system", "content": "Facts:\n- likes dark mode"}],
-        )
+        records = ae.build_context("u1", "s1", "q")
+        self.assertEqual(records[0]["text"], "Brandon prefers Glean.")
+        self.assertIsNone(records[0]["recorded_at"])
 
     def test_build_context_returns_empty_on_error(self):
         handle = FakeHandle(error=RuntimeError("memory down"))
@@ -189,6 +201,16 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(hits[0]["similarity_score"], 0.77)
         self.assertIn("2026-11-01", hits[0]["timestamp"])
         self.assertEqual(handle.search_calls[0]["top_k"], 3)
+
+    def test_search_surfaces_custom_recorded_at(self):
+        chunk = FakeChunk(
+            "fact", "semantic",
+            metadata={"metadata": {"recorded_at": "2026-11-13T00:00:00+00:00"}},
+        )
+        handle = FakeHandle(chunks=[chunk])
+        self._install(handle)
+        hits = ae.search("u1", "q")
+        self.assertEqual(hits[0]["recorded_at"], "2026-11-13T00:00:00+00:00")
 
     def test_save_semantic_upserts_by_label(self):
         handle = FakeHandle()
@@ -296,10 +318,41 @@ class ListMemoriesTest(unittest.TestCase):
         self.assertEqual(labels["taxonomic"], "cluster cost")
         self.assertEqual(labels["procedural"], "okf-pref")
 
+    def test_list_entries_carry_recorded_at_from_metadata(self):
+        client = FakeListClient({"semantic": [
+            {"id": "s1", "content": "c", "label": "name", "timestamp": "2026-11-17T22:16:54.827000",
+             "metadata": {"recorded_at": "2026-11-13T18:51:14.122559+00:00"}}
+        ]})
+        self._install(FakeMemory(FakeHandle(), list_client=client))
+        hits = ae.list_memories("u1", "semantic")
+        self.assertEqual(hits[0]["recorded_at"], "2026-11-13T18:51:14.122559+00:00")
+        self.assertEqual(hits[0]["timestamp"], "2026-11-17T22:16:54.827000")
+
     def test_swallows_transport_errors(self):
         client = FakeListClient(error=RuntimeError("down"))
         self._install(FakeMemory(FakeHandle(), list_client=client))
         self.assertEqual(ae.list_memories("u1"), [])
+
+
+class RecordedAtTest(unittest.TestCase):
+    """Migrated memories keep their real date in custom metadata (the service
+    stamps its own write time and cannot be told otherwise)."""
+
+    def test_prefers_nested_custom_recorded_at(self):
+        self.assertEqual(
+            ae._recorded_at({"metadata": {"recorded_at": "2026-11-13T18:46:07.978116+00:00"}}),
+            "2026-11-13T18:46:07.978116+00:00",
+        )
+
+    def test_reads_flat_custom_recorded_at(self):
+        self.assertEqual(
+            ae._recorded_at({"recorded_at": "2026-11-11T20:00:45.141230+00:00"}),
+            "2026-11-11T20:00:45.141230+00:00",
+        )
+
+    def test_none_when_absent(self):
+        self.assertIsNone(ae._recorded_at({"label": "name"}))
+        self.assertIsNone(ae._recorded_at(None))
 
 
 class ConfiguredTest(unittest.TestCase):

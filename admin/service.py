@@ -122,6 +122,8 @@ def _memory_row(hit: dict) -> dict:
         "label": hit.get("label") or "",
         "content": hit.get("text") or "",
         "similarity_score": hit.get("similarity_score"),
+        # The REAL date (ISO 8601) — the service timestamp is the write time.
+        "recorded_at": hit.get("recorded_at"),
         "updated_at": hit.get("timestamp"),
     }
 
