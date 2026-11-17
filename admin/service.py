@@ -114,6 +114,18 @@ def set_system_prompt(text: str, collection: Collection | None = None) -> str:
 # supersedes memories itself as it extracts them.
 
 
+def _memory_row(hit: dict) -> dict:
+    """Normalize an adapter hit for the console."""
+    return {
+        "id": hit.get("id") or "",
+        "type": hit.get("source") or "",
+        "label": hit.get("label") or "",
+        "content": hit.get("text") or "",
+        "similarity_score": hit.get("similarity_score"),
+        "updated_at": hit.get("timestamp"),
+    }
+
+
 def search_memories(
     user_id: str = DEFAULT_USER_ID,
     query: str = "",
@@ -122,17 +134,15 @@ def search_memories(
     """Ranked memories for a query, optionally restricted to one type."""
     sources = [mem_type] if mem_type else list(MEMORY_TYPES)
     hits = agent_engine.search(user_id, query, sources=sources, top_k=50)
-    return [
-        {
-            "id": hit.get("id") or "",
-            "type": hit.get("source") or "",
-            "label": hit.get("label") or "",
-            "content": hit.get("text") or "",
-            "similarity_score": hit.get("similarity_score"),
-            "updated_at": hit.get("timestamp"),
-        }
-        for hit in hits
-    ]
+    return [_memory_row(hit) for hit in hits]
+
+
+def list_memories(
+    user_id: str = DEFAULT_USER_ID,
+    mem_type: Optional[str] = None,
+) -> list[dict]:
+    """Browse a user's memories newest-first (no query needed)."""
+    return [_memory_row(hit) for hit in agent_engine.list_memories(user_id, mem_type)]
 
 
 def memory_counts(rows: list[dict]) -> dict[str, int]:

@@ -162,6 +162,18 @@ class MemoryCurationTest(unittest.TestCase):
             {"semantic", "episodic", "taxonomic", "procedural"},
         )
 
+    def test_list_memories_browses_via_the_adapter(self):
+        hits = [
+            {"text": "Brandon", "source": "semantic", "label": "name",
+             "id": "m1", "similarity_score": None, "timestamp": "2026-11-01T10:00:00"}
+        ]
+        with mock.patch.object(admin.agent_engine, "list_memories", return_value=hits) as lst:
+            rows = admin.list_memories("u1")
+        self.assertEqual(rows[0]["content"], "Brandon")
+        self.assertEqual(rows[0]["type"], "semantic")
+        self.assertEqual(rows[0]["updated_at"], "2026-11-01T10:00:00")
+        self.assertEqual(lst.call_args.args, ("u1", None))
+
     def test_memory_counts_counts_result_set_by_type(self):
         rows = [{"type": "semantic"}, {"type": "semantic"}, {"type": "taxonomic"}]
         counts = admin.memory_counts(rows)
@@ -1175,6 +1187,7 @@ def test_search_memories_endpoint_delegates_to_service(monkeypatch):
              "content": "Brandon", "similarity_score": 0.9, "updated_at": None}
         ],
     )
+    monkeypatch.setattr(admin, "list_memories", lambda user_id, mem_type=None: [])
     response = _client.get("/api/admin/memories?user_id=u1&query=who&mem_type=semantic")
     assert response.status_code == 200
     body = response.json()
@@ -1182,6 +1195,25 @@ def test_search_memories_endpoint_delegates_to_service(monkeypatch):
     assert body["query"] == "who"
     assert body["memories"][0]["content"] == "Brandon"
     assert body["counts"]["semantic"] == 1
+
+
+def test_memories_endpoint_lists_when_no_query(monkeypatch):
+    """Opening the Memories tab must SHOW memories — no query required."""
+    monkeypatch.setattr(
+        admin, "list_memories",
+        lambda user_id, mem_type=None: [
+            {"id": "m1", "type": "semantic", "label": "name",
+             "content": "Brandon", "similarity_score": None, "updated_at": None}
+        ],
+    )
+
+    def _fail_search(*a, **k):
+        raise AssertionError("search must not run without a query")
+
+    monkeypatch.setattr(admin, "search_memories", _fail_search)
+    response = _client.get("/api/admin/memories?user_id=u1")
+    assert response.status_code == 200
+    assert response.json()["memories"][0]["content"] == "Brandon"
 
 
 def test_update_memory_endpoint_maps_errors(monkeypatch):

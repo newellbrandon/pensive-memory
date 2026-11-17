@@ -36,7 +36,7 @@
     <section id="tab-memories" class="tab-panel active">
       <div class="panel-head">
         <h1>Long-term memory</h1>
-        <p class="sub">Search the user's memory in the <strong>Atlas Agent Engine memory service</strong>. Semantic facts are editable and <strong>re-embedded automatically</strong> on save.</p>
+        <p class="sub">Browse a user's memory in the <strong>Atlas Agent Engine memory service</strong>, or type a query to rank it by relevance. Semantic facts are editable and <strong>re-embedded automatically</strong> on save.</p>
       </div>
 
       <div class="type-grid" id="type-grid"></div>
@@ -47,8 +47,8 @@
           <input id="user-id" type="text" value="default" spellcheck="false" />
         </label>
         <label class="field grow">
-          <span>Query</span>
-          <input id="memory-query" type="text" placeholder="e.g. preferred search tool" spellcheck="false" />
+          <span>Query (optional)</span>
+          <input id="memory-query" type="text" placeholder="search — e.g. preferred search tool" spellcheck="false" />
         </label>
         <button id="search-memories" class="btn primary">Search</button>
         <button id="refresh-memories" class="btn ghost">Refresh</button>

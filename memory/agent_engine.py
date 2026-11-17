@@ -201,6 +201,72 @@ def search(
     return [_hit(chunk) for chunk in chunks or []]
 
 
+def _entry_hit(entry: dict, kind: str) -> dict:
+    """Normalize a service list entry to the same shape as ``_hit``.
+
+    The name lives in a different field per type (``label`` / ``title`` /
+    ``term`` / ``procedure``).
+    """
+    label = (
+        entry.get("label")
+        or entry.get("title")
+        or entry.get("term")
+        or entry.get("procedure")
+        or ""
+    )
+    return {
+        "text": str(entry.get("content") or ""),
+        "source": kind,
+        "label": str(label),
+        "id": str(entry.get("id") or ""),
+        "similarity_score": None,
+        "timestamp": str(entry.get("timestamp")) if entry.get("timestamp") else None,
+    }
+
+
+def _list_transport(memory: Memory):
+    """The SDK's own client + base path.
+
+    The SDK has no public list method for semantic/taxonomic/procedural, so the
+    console's browse view reads the service's list route through the SDK's own
+    transport — inheriting its base URL, auth, and project routing.
+    """
+    runtime = getattr(memory, "_runtime", None)
+    transport = getattr(runtime, "_transport", None)
+    client = getattr(transport, "_client", None)
+    prefix = getattr(runtime, "_base_path", None)
+    if client is None or not prefix:
+        return None, None
+    return client, prefix
+
+
+def list_memories(user_id: str, mem_type: str | None = None) -> list[dict]:
+    """List a user's memories newest-first (browse, not ranked search)."""
+    if not str(user_id or "").strip():
+        return []
+    memory = get_memory()
+    if memory is None:
+        return []
+    client, prefix = _list_transport(memory)
+    if client is None:
+        return []
+    kinds = [mem_type] if mem_type in LONG_TERM_SOURCES else list(LONG_TERM_SOURCES)
+    hits: list[dict] = []
+    for kind in kinds:
+        try:
+            response = client.get(f"{prefix}/{kind}", params={"user_id": str(user_id)})
+            response.raise_for_status()
+            entries = response.json().get("entries", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Memory list failed for %s (%s: %s)", kind, type(exc).__name__, exc
+            )
+            continue
+        hits.extend(_entry_hit(entry, kind) for entry in entries)
+    hits.sort(key=lambda hit: hit.get("timestamp") or "", reverse=True)
+    return hits
+
+
 def save_semantic(
     user_id: str, label: str, text: str, *, visibility: str = "private"
 ) -> Optional[dict]:

@@ -65,8 +65,12 @@ async def get_memory_types() -> dict:
 async def search_memories(
     user_id: str = "default", query: str = "", mem_type: Optional[str] = None
 ) -> dict:
-    """Ranked memory search for the console (backed by the Agent Engine SDK)."""
-    rows = admin.search_memories(user_id, query, mem_type)
+    """Browse (no query) or rank-search (query) a user's memories."""
+    rows = (
+        admin.search_memories(user_id, query, mem_type)
+        if query.strip()
+        else admin.list_memories(user_id, mem_type)
+    )
     return {
         "user_id": user_id,
         "query": query,

@@ -78,9 +78,14 @@ class FakeHandle:
 
 
 class FakeMemory:
-    def __init__(self, handle):
+    def __init__(self, handle, *, list_client=None, base_path="/api/v1/memory"):
         self.handle = handle
         self.bound: list = []
+        if list_client is not None:
+            transport = type("T", (), {"_client": list_client})()
+            self._runtime = type(
+                "R", (), {"_transport": transport, "_base_path": base_path}
+            )()
 
     def bind(self, ctx):
         self.bound.append(ctx)
@@ -207,6 +212,94 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(ae.record_turn("u1", "s1", "user", "hi"))
         self.assertEqual(ae.search("u1", "q"), [])
         self.assertIsNone(ae.save_semantic("u1", "l", "t"))
+
+
+class FakeResponse:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"entries": self._entries}
+
+
+class FakeListClient:
+    """Stands in for the SDK's own httpx.Client (list endpoints)."""
+
+    def __init__(self, entries_by_kind=None, error=None):
+        self.entries_by_kind = entries_by_kind or {}
+        self.error = error
+        self.calls = []
+
+    def get(self, url, params=None):
+        self.calls.append((url, params))
+        if self.error:
+            raise self.error
+        kind = url.rsplit("/", 1)[-1]
+        return FakeResponse(self.entries_by_kind.get(kind, []))
+
+
+class ListMemoriesTest(unittest.TestCase):
+    """Browsing: the SDK has no public list for these types, so the adapter
+    reads the service's list route through the SDK's own transport."""
+
+    def setUp(self):
+        ae.reset()
+        self.addCleanup(ae.reset)
+
+    def _install(self, memory):
+        patcher = mock.patch.object(ae, "get_memory", lambda: memory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_lists_all_types_sorted_newest_first(self):
+        client = FakeListClient({
+            "semantic": [{"id": "s1", "content": "Name is Brandon", "label": "name",
+                          "timestamp": "2026-11-01T10:00:00"}],
+            "episodic": [{"id": "e1", "content": "Fixed UI", "label": "ui",
+                          "timestamp": "2026-11-02T10:00:00"}],
+        })
+        self._install(FakeMemory(FakeHandle(), list_client=client))
+        hits = ae.list_memories("u1")
+        self.assertEqual([h["id"] for h in hits], ["e1", "s1"])  # newest first
+        self.assertEqual({h["source"] for h in hits}, {"semantic", "episodic"})
+        self.assertEqual(
+            {url for url, _ in client.calls},
+            {f"/api/v1/memory/{k}" for k in ae.LONG_TERM_SOURCES},
+        )
+        self.assertEqual(client.calls[0][1], {"user_id": "u1"})
+
+    def test_lists_one_type_when_filtered(self):
+        client = FakeListClient({"taxonomic": [
+            {"id": "t1", "content": "c", "label": "Cloud", "timestamp": "x"}
+        ]})
+        self._install(FakeMemory(FakeHandle(), list_client=client))
+        hits = ae.list_memories("u1", "taxonomic")
+        self.assertEqual([h["source"] for h in hits], ["taxonomic"])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_returns_empty_when_unconfigured(self):
+        self._install(None)
+        self.assertEqual(ae.list_memories("u1"), [])
+
+    def test_uses_type_specific_name_fields_for_labels(self):
+        client = FakeListClient({
+            "episodic": [{"id": "e1", "content": "c", "title": "Rewrote memory system", "timestamp": "t"}],
+            "taxonomic": [{"id": "t1", "content": "c", "term": "cluster cost", "timestamp": "t"}],
+            "procedural": [{"id": "p1", "content": "c", "procedure": "okf-pref", "timestamp": "t"}],
+        })
+        self._install(FakeMemory(FakeHandle(), list_client=client))
+        labels = {h["source"]: h["label"] for h in ae.list_memories("u1")}
+        self.assertEqual(labels["episodic"], "Rewrote memory system")
+        self.assertEqual(labels["taxonomic"], "cluster cost")
+        self.assertEqual(labels["procedural"], "okf-pref")
+
+    def test_swallows_transport_errors(self):
+        client = FakeListClient(error=RuntimeError("down"))
+        self._install(FakeMemory(FakeHandle(), list_client=client))
+        self.assertEqual(ae.list_memories("u1"), [])
 
 
 class ConfiguredTest(unittest.TestCase):

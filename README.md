@@ -253,12 +253,28 @@ a chat turn never fails because memory is down.
 
 ### Console
 
-The **Memories** tab searches a user's memory (`Memory.search`) and edits
-semantic facts in place (`Memory.save_semantic`, upsert by label — re-embedded
-automatically). There is no manual delete or merge: the service versions and
-supersedes memories itself.
+The **Memories** tab **browses** a user's memory (newest first) and, when you type a query, ranks it by relevance (`Memory.search`). Semantic facts are editable in place (`Memory.save_semantic`, upsert by label — re-embedded automatically). There is no manual delete or merge: the service versions and supersedes memories itself.
+
+The browse read uses the service's list route through the SDK's own transport: the SDK exposes no public list method for semantic/taxonomic/procedural memories, so `agent_engine.list_memories` reaches the same endpoint the SDK's typed reads use (same base URL, auth, and project routing).
 
 ![Long-term memory in the Pensive Console: search results across the four types](console_long_term_memory.png)
+
+### Migrating pre-existing memories
+
+If you ran Pensive before this change, its old memories are still in the
+`agent_memories` collection. Move them into the service with:
+
+```bash
+docker compose exec pensive-api python scripts/migrate_memories.py --dry-run
+docker compose exec pensive-api python scripts/migrate_memories.py
+```
+
+It maps each legacy record to the matching typed write (slugifying procedural
+names, which the service validates), and records every migrated key in a
+`pensive_memory_migration` ledger so re-runs are safe — the typed writes are
+create-only, so without the ledger a re-run would duplicate episodes, taxonomic
+terms, and procedures. The legacy collection is never modified. Use `--user` /
+`--type` to narrow the scope.
 
 ### Memory pays off on repeat work (tokens, tools, runtime)
 
@@ -532,7 +548,8 @@ pensive/
 │   └── llm.py              # OpenAI Responses API (+ usage) + Voyage embeddings clients
 ├── agent-workspaces/       # per-agent sandboxes (gitignored, host-mounted)
 └── scripts/
-    └── glean_auth.py       # one-shot host-side Glean OAuth (loopback + fragment relay)
+    ├── glean_auth.py       # one-shot host-side Glean OAuth (loopback + fragment relay)
+    └── migrate_memories.py # move legacy agent_memories into the Agent Engine service
 ```
 
 ## Background

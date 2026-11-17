@@ -120,22 +120,16 @@ async function loadMemories() {
   const query = document.getElementById("memory-query").value.trim();
   state.user_id = user_id;
   state.query = query;
-  const list = document.getElementById("memory-list");
-  if (!query) {
-    // The Agent Engine memory service is searched, not listed: a query is
-    // required to rank a user's memories.
-    list.innerHTML = `<div class="empty">Enter a query to search “${esc(user_id)}”'s memory.</div>`;
-    updateCounts({});
-    return;
-  }
-  const params = new URLSearchParams({ user_id, query });
+  const params = new URLSearchParams({ user_id });
+  if (query) params.set("query", query);
   if (state.mem_type) params.set("mem_type", state.mem_type);
   try {
     const data = await api(`/api/admin/memories?${params}`);
     renderMemories(data.memories);
     updateCounts(data.counts);
   } catch (error) {
-    list.innerHTML = `<div class="empty">Could not search memories: ${esc(error.message)}</div>`;
+    document.getElementById("memory-list").innerHTML =
+      `<div class="empty">Could not load memories: ${esc(error.message)}</div>`;
   }
 }
 
@@ -166,7 +160,7 @@ function updateCounts(counts) {
 function renderMemories(rows) {
   const list = document.getElementById("memory-list");
   if (!rows.length) {
-    list.innerHTML = `<div class="empty">No memories matched${state.mem_type ? ` (${esc(state.mem_type)})` : ""} for “${esc(state.query)}”.</div>`;
+    list.innerHTML = `<div class="empty">No memories${state.mem_type ? ` of type ${esc(state.mem_type)}` : ""} for “${esc(state.user_id)}”${state.query ? ` matching “${esc(state.query)}”` : ""}.</div>`;
     return;
   }
   list.innerHTML = "";
