@@ -58,6 +58,20 @@ function fmtWhen(value) {
   return date.toLocaleString();
 }
 
+function fmtWhenShort(value) {
+  // Short local date + time for dense rows: no seconds, no offset noise.
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 16).replace("T", " ");
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 /* ---------- tabs ---------- */
 
 document.getElementById("tabs").addEventListener("click", (event) => {
@@ -180,12 +194,14 @@ function memoryRow(row) {
     row.similarity_score != null ? ` · score ${Number(row.similarity_score).toFixed(2)}` : "";
   const editable = row.type === "semantic";
   const when = row.recorded_at || row.updated_at;
+  // Full ISO 8601 stays available on hover; the row shows a short local time.
+  const whenTitle = row.recorded_at ? `recorded ${row.recorded_at}` : `stored ${row.updated_at || ""}`;
 
   div.innerHTML = `
     <div class="row-head">
       <span class="badge" style="background:${TYPE_COLORS[row.type] || "#00ed64"}22;color:${TYPE_COLORS[row.type] || "#00ed64"}">${esc(row.type)}</span>
       <span class="label" title="${esc(subtitle)}">${esc(row.label || "")}</span>
-      <span class="when" title="${row.recorded_at ? "recorded" : "stored"}">${esc(when || "")}${score}</span>
+      <span class="when" title="${esc(whenTitle)}">${esc(fmtWhenShort(when))}${score}</span>
     </div>
     <p class="content">${esc(row.content)}</p>
     ${editable ? '<div class="row-actions"><button class="btn ghost small" data-action="edit">Edit</button></div>' : ""}
