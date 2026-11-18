@@ -256,6 +256,22 @@ To use the hosted platform instead, set `AGENTIC_MEMORY_PROJECT_ID` +
 when it is unreachable — memory degrades to a no-op: a chat turn never fails
 because memory is down.
 
+### Known limitation: background extraction
+
+The service turns conversations into durable memories by promoting an idle
+session to a snapshot and running the extraction LLM over it. That promotion is
+driven by the orchestration engine's **consolidation scanner**, which sweeps the
+**orchestration engine's own session records**. Pensive writes turns straight
+through the memory API (`Memory.record_turn`), so it never creates those records
+and the scanner has nothing to sweep: turns accumulate in `memory_short_term`,
+but nothing is distilled from them into `memory_semantic` / `memory_episodic` /
+`memory_taxonomic` / `memory_procedural`.
+
+Memories written explicitly (`Memory.save_semantic`, …) and migrated memories
+are unaffected. To close the gap, either run the Agent Engine app alongside (so
+sessions exist for the scanner) or have Pensive extract facts itself and write
+them with the typed SDK writes.
+
 ### Console
 
 The **Memories** tab **browses** a user's memory (newest first) and, when you type a query, ranks it by relevance (`Memory.search`). Semantic facts are editable in place (`Memory.save_semantic`, upsert by label — re-embedded automatically). There is no manual delete or merge: the service versions and supersedes memories itself.

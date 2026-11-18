@@ -113,6 +113,12 @@ services:
       - MEMORY_SERVER_URL=http://memory-server:8081
       - OE_HTTP_PORT=8000
       - OE_GRPC_PORT=50051
+      # The OE's consolidation scanner is what promotes idle sessions to
+      # snapshots and triggers extraction. It sweeps the OE's OWN session
+      # records, so it only fires for sessions the Agent Engine runtime created
+      # (not for turns Pensive writes straight through the memory API) — see
+      # README "Known limitation".
+      - MONGOMEM_CONSOLIDATION_ENABLED=true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
