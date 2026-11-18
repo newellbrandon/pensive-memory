@@ -20,6 +20,16 @@ short_term:
   # keeps record_turn fast.
   embed_on_write: false
 
+# Promote idle sessions to snapshots and extract durable memories from them.
+# Without this block the server never auto-promotes, so nothing is extracted.
+background_extraction:
+  snapshot:
+    max_messages: 20
+    stale_minutes: 1
+    embed_stm_before_promotion: true
+    delete_promoted: false
+    ttl_days: 30
+
 extraction:
   enabled:
     - semantic
