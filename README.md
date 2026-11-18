@@ -3,7 +3,7 @@
 A minimal AI agent demo using **LangGraph** for workflow orchestration, **MongoDB** for short-term conversation state, and the **Atlas Agent Engine memory service** (`agent-engine-sdk-memory`) for long-term memory:
 
 - **Short-term memory** — LangGraph checkpoints (`MongoDBSaver`) persist conversation state per thread
-- **Long-term memory** — the Atlas Agent Engine memory service: Pensive appends turns with `Memory.record_turn` (the service extracts durable semantic/episodic/taxonomic/procedural facts in the background) and assembles prompt context with `Memory.build_context`
+- **Long-term memory** — the Atlas Agent Engine memory service: Pensive records turns with `Memory.record_turn` and distils durable semantic/episodic/taxonomic/procedural facts itself (the service's own extraction only runs for turns its runtime records), then assembles prompt context with `Memory.build_context`
 
 The API is **OpenAI-compatible** so you can connect [OpenWebUI](https://docs.openwebui.com/) or a coding harness (e.g. OpenCode) and chat with the agent. Workflow decisions render as native reasoning **Thought** blocks; the assistant message contains only the final answer.
 
@@ -95,9 +95,10 @@ while providing persistent memory for important context:
   `/v1/responses`), and tool results replay as `function_call_output` items — so
   a coding harness can drive read/write/execute tools through Pensive.
 - **Persistent memory runs on top.** Every turn is recorded to the Atlas Agent
-  Engine memory service (scoped by `user_id` and session), which extracts durable
-  facts in the background; each turn's prompt is grounded with `build_context`
-  over those facts, so they carry across sessions, chats, and workflows.
+  Engine memory service (scoped by `user_id` and session), and Pensive distils
+  durable facts from it with its own LLM; each turn's prompt is grounded with
+  `build_context` over those facts, so they carry across sessions, chats, and
+  workflows.
 - **Subagent delegation keeps the primary context clean.** Main-context chats are
   offered a server-side `pensive_subagent` tool: the model can delegate a
   self-contained task (research, builds, long tool chains) to an isolated
@@ -232,14 +233,12 @@ service; everything else calls it:
    episodic] …`, newest first) so the model can reason about *when* things
    happened. The service's own `timestamp` is the write time, so Pensive prefers
    the original `recorded_at` (preserved in metadata for migrated memories).
-4. **Write-back** (`save_memory`) — `Memory.record_turn` appends the user and
-   assistant turns (idempotency-keyed, so a retried request never double-records).
-   The service extracts durable facts from those turns **in the background**, so
-   Pensive no longer runs its own extraction, merging, or dedup pass.
-
-Because extraction is asynchronous, a fact learned in one conversation appears a
-little later than the turn that taught it — recent turns are covered by the
-harness transcript in the meantime.
+4. **Write-back** (`save_memory`) — Pensive records the turn
+   (`Memory.record_turn`, idempotency-keyed so a retried request never
+   double-records) and extracts durable facts from it with its own LLM,
+   persisting each as a typed memory (`save_semantic` / `save_episode` /
+   `save_taxonomic` / `save_procedure`). It extracts itself because the service's
+   background extraction only runs for turns the Agent Engine runtime records.
 
 ### Where memory is stored
 
@@ -256,21 +255,18 @@ To use the hosted platform instead, set `AGENTIC_MEMORY_PROJECT_ID` +
 when it is unreachable — memory degrades to a no-op: a chat turn never fails
 because memory is down.
 
-### Known limitation: background extraction
+### Extraction is Pensive's
 
-The service turns conversations into durable memories by promoting an idle
-session to a snapshot and running the extraction LLM over it. That promotion is
-driven by the orchestration engine's **consolidation scanner**, which sweeps the
-**orchestration engine's own session records**. Pensive writes turns straight
-through the memory API (`Memory.record_turn`), so it never creates those records
-and the scanner has nothing to sweep: turns accumulate in `memory_short_term`,
-but nothing is distilled from them into `memory_semantic` / `memory_episodic` /
-`memory_taxonomic` / `memory_procedural`.
-
-Memories written explicitly (`Memory.save_semantic`, …) and migrated memories
-are unaffected. To close the gap, either run the Agent Engine app alongside (so
-sessions exist for the scanner) or have Pensive extract facts itself and write
-them with the typed SDK writes.
+The service normally distils conversations into durable memories itself, but that
+path is driven by the orchestration engine's consolidation scanner, which sweeps
+the **orchestration engine's own session records** — records Pensive never
+creates (it writes turns straight through the memory API). So Pensive distils the
+facts itself: `save_memory` extracts durable, typed memories from the turn with
+Pensive's LLM and persists each through the matching typed SDK write
+(`save_semantic` / `save_episode` / `save_taxonomic` / `save_procedure`). It also
+records the turn (`Memory.record_turn`) so the conversation lives on the service.
+The orchestration engine is used only as the SDK's routing proxy — no Agent
+Engine app runs.
 
 ### Console
 
@@ -512,7 +508,7 @@ Workflow:
 
 **Answer:** "Yes, Brandon! Good to hear from you again. How can I help?"
 
-Session 2 demonstrates **long-term memory**: the fact was recorded to the Agent Engine memory service in Session 1, extracted in the background, and retrieved via `Memory.build_context` in a separate OpenWebUI chat. Session 2 adds another checkpoint thread (~6 checkpoints, ~18 writes).
+Session 2 demonstrates **long-term memory**: the fact was recorded to the Agent Engine memory service in Session 1, distilled into a durable memory, and retrieved via `Memory.build_context` in a separate OpenWebUI chat. Session 2 adds another checkpoint thread (~6 checkpoints, ~18 writes).
 
 ## API Endpoints
 
@@ -556,7 +552,7 @@ pensive/
 │   └── service.py          # agent registry, run loop + metrics, memory curation, run history
 ├── memory/
 │   ├── agent_engine.py     # Atlas Agent Engine memory adapter (agent-engine-sdk-memory)
-│   └── memories.py         # per-turn intent planning (query + research classification)
+│   └── memories.py         # per-turn intent planning + durable-fact extraction
 ├── glean/
 │   ├── oauth.py            # MCP dynamic-client OAuth2 (discovery, DCR, PKCE, refresh)
 │   ├── client.py           # MCP client wrapper (one session per operation)

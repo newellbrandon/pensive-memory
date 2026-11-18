@@ -564,8 +564,9 @@ class ModelWindowTest(SpawnSubagentTest):
 
 class AgentEngineMemoryNodeTest(unittest.TestCase):
     """The memory nodes talk to the Agent Engine memory service through the
-    adapter: reads assemble context with ``build_context``, writes append turns
-    with ``record_turn`` (the server extracts durable facts in the background)."""
+    adapter: reads assemble context with ``build_context``, writes record the
+    turn and persist durable facts with the typed SDK writes (the service's own
+    background extraction does not run for externally-written turns)."""
 
     def setUp(self):
         self.emit = mock.patch("agent.nodes._emit_decision").start()
@@ -593,28 +594,44 @@ class AgentEngineMemoryNodeTest(unittest.TestCase):
         build.assert_not_called()
         self.assertEqual(result["memory_context"], [])
 
-    def test_save_memory_records_user_and_assistant_turns(self):
+    def test_save_memory_records_turn_and_saves_extracted_facts(self):
         state = _state()
         state["response"] = "Done."
+        fact = {"type": "semantic", "text": "Likes teal.", "label": "colour"}
         with mock.patch.object(
             nodes.agent_engine, "record_turn", return_value=True
-        ) as rec:
-            result = _run(nodes.save_memory(state, None))
+        ) as rec, mock.patch(
+            "agent.nodes.get_responses_client"
+        ), mock.patch.object(
+            nodes.memories, "extract_memories",
+            new=mock.AsyncMock(return_value=[fact]),
+        ) as extract, mock.patch.object(
+            nodes.agent_engine, "save_facts", return_value=1
+        ) as save:
+            _run(nodes.save_memory(state, None))
         calls = [(c.args[2], c.args[3]) for c in rec.call_args_list]
         self.assertEqual(
             calls, [("user", "delegate the research"), ("assistant", "Done.")]
         )
         self.assertEqual(rec.call_args_list[0].args[:2], ("u1", "thread-1"))
+        extract.assert_awaited_once()
+        self.assertEqual(save.call_args.args[0], "u1")
+        self.assertEqual(save.call_args.args[1], [fact])
+        self.assertEqual(save.call_args.kwargs["session_id"], "thread-1")
         emitted = [(c.args[0], c.args[1]) for c in self.emit.call_args_list]
         self.assertIn(("save_memory", "saved"), emitted)
 
-    def test_save_memory_reports_skipped_when_nothing_recorded(self):
+    def test_save_memory_skips_when_nothing_durable(self):
         state = _state()
         state["response"] = ""
         with mock.patch.object(
-            nodes.agent_engine, "record_turn", return_value=False
+            nodes.agent_engine, "record_turn", return_value=True
+        ), mock.patch("agent.nodes.get_responses_client"), mock.patch.object(
+            nodes.memories, "extract_memories", new=mock.AsyncMock(return_value=[]),
+        ), mock.patch.object(
+            nodes.agent_engine, "save_facts", return_value=0
         ):
-            result = _run(nodes.save_memory(state, None))
+            _run(nodes.save_memory(state, None))
         emitted = [(c.args[0], c.args[1]) for c in self.emit.call_args_list]
         self.assertIn(("save_memory", "skipped"), emitted)
 

@@ -355,6 +355,78 @@ class RecordedAtTest(unittest.TestCase):
         self.assertIsNone(ae._recorded_at(None))
 
 
+class SaveFactsTest(unittest.TestCase):
+    """Pensive distils durable facts itself (the service's own extraction only
+    runs for turns its runtime records) and writes them with typed SDK calls."""
+
+    def setUp(self):
+        ae.reset()
+        self.addCleanup(ae.reset)
+
+    def _install(self, memory):
+        patcher = mock.patch.object(ae, "get_memory", lambda: memory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_maps_each_type_to_its_typed_write(self):
+        calls: list = []
+
+        class FakeMemory:
+            def save_semantic(self, **kw): calls.append(("semantic", kw))
+            def save_episode(self, **kw): calls.append(("episodic", kw))
+            def save_taxonomic(self, **kw): calls.append(("taxonomic", kw))
+            def save_procedure(self, **kw): calls.append(("procedural", kw))
+
+        self._install(FakeMemory())
+        facts = [
+            {"type": "semantic", "text": "Likes teal.", "label": "colour"},
+            {"type": "episodic", "text": "Met at the Atlanta office.", "label": "atlanta"},
+            {"type": "taxonomic", "text": "Strydn is a platform.", "label": "strydn"},
+            {"type": "procedural", "text": "Prefers short answers.", "label": "answer_style"},
+        ]
+        saved = ae.save_facts("u1", facts, session_id="thread-9")
+        self.assertEqual(saved, 4)
+        self.assertEqual([k for k, _ in calls], ["semantic", "episodic", "taxonomic", "procedural"])
+        by_kind = dict(calls)
+        self.assertEqual(by_kind["semantic"]["label"], "colour")
+        self.assertEqual(by_kind["episodic"]["session_id"], "thread-9")
+        self.assertEqual(by_kind["episodic"]["title"], "atlanta")
+        self.assertEqual(by_kind["taxonomic"]["domain"], "general")
+        self.assertEqual(by_kind["taxonomic"]["visibility"], "private")
+        # The service validates procedure names: slug it.
+        self.assertEqual(by_kind["procedural"]["procedure"], "answer-style")
+        self.assertRegex(by_kind["procedural"]["procedure"], ae.PROCEDURE_PATTERN)
+
+    def test_skips_unknown_type_and_blank_text(self):
+        calls: list = []
+
+        class FakeMemory:
+            def save_semantic(self, **kw): calls.append(kw)
+
+        self._install(FakeMemory())
+        saved = ae.save_facts("u1", [
+            {"type": "bogus", "text": "x", "label": "l"},
+            {"type": "semantic", "text": "   ", "label": "l"},
+        ])
+        self.assertEqual(saved, 0)
+        self.assertEqual(calls, [])
+
+    def test_duplicate_writes_do_not_count_as_saved(self):
+        class FakeMemory:
+            def save_semantic(self, **kw):
+                raise RuntimeError("Duplicate document: uniqueness constraint violated")
+
+        self._install(FakeMemory())
+        saved = ae.save_facts("u1", [{"type": "semantic", "text": "x", "label": "l"}])
+        self.assertEqual(saved, 0)
+
+    def test_unconfigured_is_a_noop(self):
+        self._install(None)
+        self.assertEqual(
+            ae.save_facts("u1", [{"type": "semantic", "text": "x", "label": "l"}]), 0
+        )
+
+
 class ConfiguredTest(unittest.TestCase):
     def setUp(self):
         ae.reset()

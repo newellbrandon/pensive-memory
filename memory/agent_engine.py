@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from typing import Any, Optional, Sequence
 
 from agent_engine_sdk_memory import Memory, MemoryRequestContext
@@ -31,6 +32,24 @@ logger = logging.getLogger(__name__)
 # extraction types). STM is intentionally excluded — see the module docstring.
 LONG_TERM_SOURCES = ("semantic", "episodic", "taxonomic", "procedural")
 ALL_SOURCES = LONG_TERM_SOURCES
+
+# "kind" -> SDK method name (the typed writes use irregular plurals).
+SDK_METHOD = {
+    "semantic": "save_semantic",
+    "episodic": "save_episode",
+    "taxonomic": "save_taxonomic",
+    "procedural": "save_procedure",
+}
+# The service validates procedure names against this pattern.
+PROCEDURE_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_NON_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(value: str, *, fallback: str = "memory") -> str:
+    """Slug a name to the service's ``^[a-z0-9]+(-[a-z0-9]+)*$`` pattern."""
+    slug = _NON_SLUG.sub("-", str(value or "").lower()).strip("-")
+    return slug or fallback
+
 
 _memory: Optional[Memory] = None
 
@@ -312,6 +331,68 @@ def list_memories(user_id: str, mem_type: str | None = None) -> list[dict]:
         hits.extend(_entry_hit(entry, kind) for entry in entries)
     hits.sort(key=lambda hit: hit.get("timestamp") or "", reverse=True)
     return hits
+
+
+def _fact_write(
+    user_id: str, fact: dict, session_id: str | None = None
+) -> tuple[str, dict] | None:
+    """Map an extracted fact to ``(sdk_kind, kwargs)``. ``None`` means skip."""
+    mem_type = str(fact.get("type") or "").strip().lower()
+    text = str(fact.get("text") or "").strip()
+    if mem_type not in SDK_METHOD or not text:
+        return None
+    label = str(fact.get("label") or "").strip() or (
+        f"memory-{hashlib.sha256(text.encode()).hexdigest()[:8]}"
+    )
+    if mem_type == "semantic":
+        return "semantic", dict(text=text, label=label, user_id=user_id)
+    if mem_type == "episodic":
+        return "episodic", dict(
+            title=label, content=text, user_id=user_id, session_id=session_id or "pensive"
+        )
+    if mem_type == "taxonomic":
+        return "taxonomic", dict(
+            domain="general", term=label, definition=text,
+            user_id=user_id, visibility="private",
+        )
+    return "procedural", dict(
+        procedure=slugify(label), description=text[:200], content=text, user_id=user_id
+    )
+
+
+def save_facts(
+    user_id: str, facts: Sequence[dict], *, session_id: str | None = None
+) -> int:
+    """Persist extracted facts through the typed SDK writes.
+
+    The service's own background extraction only runs for turns the Agent Engine
+    runtime records, so Pensive distils durable facts itself and writes them
+    here. Returns the number saved.
+    """
+    if not str(user_id or "").strip() or not facts:
+        return 0
+    memory = get_memory()
+    if memory is None:
+        return 0
+    saved = 0
+    for fact in facts:
+        plan = _fact_write(user_id, fact, session_id)
+        if plan is None:
+            continue
+        kind, kwargs = plan
+        try:
+            getattr(memory, SDK_METHOD[kind])(**kwargs)
+            saved += 1
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).lower()
+            if (
+                "already exists" in message
+                or "duplicate" in message
+                or "uniqueness constraint" in message
+            ):
+                continue  # an equivalent memory already exists
+            logger.warning("Memory save failed (%s: %s)", type(exc).__name__, exc)
+    return saved
 
 
 def save_semantic(

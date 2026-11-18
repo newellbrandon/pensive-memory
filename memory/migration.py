@@ -26,29 +26,18 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+from memory.agent_engine import PROCEDURE_PATTERN, SDK_METHOD, slugify
 
 logger = logging.getLogger(__name__)
 
 LEGACY_COLLECTION = "agent_memories"
 LEDGER_COLLECTION = "pensive_memory_migration"
 
-# The service validates procedure names against this pattern.
-PROCEDURE_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-_NON_SLUG = re.compile(r"[^a-z0-9]+")
-
 # Legacy types that map to a typed SDK write.
 KNOWN_TYPES = ("semantic", "episodic", "taxonomic", "procedural")
-
-# Plan "kind" -> SDK method name. Note the irregular plural forms.
-SDK_METHOD = {
-    "semantic": "save_semantic",
-    "episodic": "save_episode",
-    "taxonomic": "save_taxonomic",
-    "procedural": "save_procedure",
-}
 
 
 @dataclass(frozen=True)
@@ -61,12 +50,6 @@ class LegacyMemory:
     label: str
     content: str
     recorded_at: str | None = None
-
-
-def slugify(value: str, *, fallback: str = "memory") -> str:
-    """Slug a name to the service's ``^[a-z0-9]+(-[a-z0-9]+)*$`` pattern."""
-    slug = _NON_SLUG.sub("-", str(value or "").lower()).strip("-")
-    return slug or fallback
 
 
 def _fallback_label(mem: LegacyMemory) -> str:

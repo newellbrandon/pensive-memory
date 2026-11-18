@@ -100,5 +100,36 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(plan.query, "user interests")
 
 
+class ExtractTest(unittest.TestCase):
+    def test_parses_typed_memories(self):
+        payload = json.dumps({"memories": [
+            {"type": "semantic", "text": "Name is Brandon", "label": "name"},
+            {"type": "episodic", "text": "Discussed MongoDB", "label": "today"},
+        ]})
+        facts = _run(mem.extract_memories(FakeClient(payload), "My name is Brandon"))
+        self.assertEqual([f["type"] for f in facts], ["semantic", "episodic"])
+        self.assertEqual(facts[0]["label"], "name")
+        self.assertEqual(facts[0]["text"], "Name is Brandon")
+
+    def test_drops_unknown_types_and_blank_text(self):
+        payload = json.dumps({"memories": [
+            {"type": "bogus", "text": "x", "label": "l"},
+            {"type": "semantic", "text": "   ", "label": "l"},
+            {"type": "procedural", "text": "ok", "label": "p"},
+        ]})
+        facts = _run(mem.extract_memories(FakeClient(payload), "x"))
+        self.assertEqual([f["type"] for f in facts], ["procedural"])
+
+    def test_failure_returns_empty(self):
+        self.assertEqual(
+            _run(mem.extract_memories(FakeClient(RuntimeError("boom")), "x")), []
+        )
+
+    def test_blank_message_is_skipped(self):
+        client = FakeClient("{}")
+        self.assertEqual(_run(mem.extract_memories(client, "  ")), [])
+        self.assertEqual(client.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

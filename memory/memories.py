@@ -42,6 +42,56 @@ INTENT_PROMPT = (
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
+EXTRACT_PROMPT = (
+    "Extract durable long-term memories from the user's message and classify each "
+    "into one of these types:\n"
+    "- semantic: stable facts and preferences about the user\n"
+    "- episodic: a specific past event or interaction\n"
+    "- taxonomic: categories or domain knowledge the user relies on\n"
+    "- procedural: how the user does things (steps, preferences for output)\n"
+    "Save only explicit, lasting information. Do not save questions or transient "
+    "chit-chat. Give each a short, stable `label` (lowercase, no trailing "
+    "punctuation) so the same fact re-saved later maps to the same memory.\n"
+    'Return JSON only: {"memories": [{"type": "semantic|episodic|taxonomic|procedural", '
+    '"text": str, "label": str}]}. An empty list means nothing durable was shared.'
+)
+
+
+async def extract_memories(client: Any, text: str) -> list[dict]:
+    """Ask the LLM for the durable, typed memories in a message.
+
+    The Agent Engine service would do this in the background, but only for turns
+    its own runtime records; Pensive writes turns straight through the memory
+    API, so it distils the facts itself and persists them with typed writes.
+    """
+    if not str(text or "").strip():
+        return []
+    try:
+        raw = await client.agenerate(
+            [SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=str(text))]
+        )
+        data = _extract_json(str(raw), _JSON_OBJECT)
+        memories = data.get("memories") if isinstance(data, dict) else None
+        if not isinstance(memories, list):
+            return []
+        cleaned: list[dict] = []
+        for item in memories:
+            if not isinstance(item, dict):
+                continue
+            mem_type = str(item.get("type") or "").strip().lower()
+            if mem_type in MEMORY_TYPES and str(item.get("text") or "").strip():
+                cleaned.append(
+                    {
+                        "type": mem_type,
+                        "text": str(item["text"]).strip(),
+                        "label": str(item.get("label") or "").strip(),
+                    }
+                )
+        return cleaned
+    except Exception:
+        logger.exception("Memory extraction failed")
+        return []
+
 
 class MemoryPlan(BaseModel):
     intent: str = Field(description="Short description of what the user wants.")
