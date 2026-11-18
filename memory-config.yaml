@@ -1,0 +1,36 @@
+# Atlas Agent Engine memory server configuration for Pensive.
+#
+# The memory server runs in Pensive's docker-compose against Pensive's OWN
+# MongoDB (MONGODB_URI) — no separate database instance and no external Agent
+# Engine stack. MongoDB must have Vector Search enabled (the server provisions
+# its own search indexes on startup).
+#
+# `extraction_llm` must point at an OpenAI-compatible chat endpoint; it is the
+# model that distils recorded turns into durable memories in the background.
+# Keep it in sync with .env (LLM_URI / LLM_MODEL / LLM_KEY).
+log_level: info
+
+voyage:
+  # Embedding model for memories. Pensive's LLM_EMBEDDING_KEY is a Voyage key.
+  model: voyage-4-large
+  dimension: 1024
+
+short_term:
+  # Embed each turn on write. Off: background extraction embeds instead, which
+  # keeps record_turn fast.
+  embed_on_write: false
+
+extraction:
+  enabled:
+    - semantic
+    - episodic
+    - taxonomic
+    - procedural
+
+extraction_llm:
+  provider: openai
+  model: deepseek-v4.1-flash
+  base_url: https://ai-gateway.corp.mongodb.com/openai/v1
+  api_key_secret: LLM_API_KEY
+  # Valid values: authorization | api-key
+  auth_header: authorization

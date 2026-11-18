@@ -34,10 +34,10 @@ services:
       - GLEAN_SCOPE=${GLEAN_SCOPE:-SEARCH DOCUMENTS ENTITIES MCP}
       - GLEAN_REDIRECT_URI=${GLEAN_REDIRECT_URI:-http://localhost:8000/glean/callback}
       - GLEAN_TOKEN_CACHE=/app/.glean-tokens.json
-      # Atlas Agent Engine long-term memory (agent-engine-sdk-memory). The
-      # default targets the local `agentengine dev up` orchestration engine on
-      # the host; set AGENTIC_MEMORY_* in .env for the hosted platform.
-      - AGENTIC_MEMORY_BASE_URL=${AGENTIC_MEMORY_BASE_URL:-http://host.docker.internal:56423}
+      # Long-term memory (agent-engine-sdk-memory). The SDK talks to the
+      # orchestration engine in this compose file, which proxies to the memory
+      # server — both backed by Pensive's own MongoDB (MONGODB_URI).
+      - AGENTIC_MEMORY_BASE_URL=${AGENTIC_MEMORY_BASE_URL:-http://memory-oe:8000}
       - AGENTIC_MEMORY_PROJECT_ID=${AGENTIC_MEMORY_PROJECT_ID:-}
       - AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN=${AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN:-}
       - AGENTIC_MEMORY_MAX_TOKENS=${AGENTIC_MEMORY_MAX_TOKENS:-2048}
@@ -62,3 +62,65 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  # --- Atlas Agent Engine long-term memory --------------------------------
+  # The memory server stores memories (semantic/episodic/taxonomic/procedural
+  # + short-term turns) in Pensive's own MongoDB. The orchestration engine
+  # proxies the SDK's /api/v1/memory/* calls to it. Both share MONGODB_URI, so
+  # there is exactly one database instance.
+  memory-server:
+    image: ghcr.io/mongodb/agent-engine-client-libraries/memory-server:0.11.8
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - ORG_ID=${PENSIVE_ORG_ID:-000000000000000000000001}
+      - PROJECT_ID=${PENSIVE_PROJECT_ID:-70656e736976650000000001}
+      - APP_ID=${PENSIVE_APP_ID:-70656e736976650000000002}
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8081
+      - MONGOMEM_CONFIG_FILE=/etc/agentic/memory-config/memory-config.yaml
+      # Pensive-owned database on Pensive's MongoDB (overrides the server's
+      # legacy-name detection so it never adopts another project's database).
+      - MONGOMEM_DB_NAME=${PENSIVE_MEMORY_DB:-pensive_memory}
+      - MONGOMEM_EMBEDDING_DIMENSION=${EMBEDDING_DIMENSIONS:-1024}
+      - VOYAGE_API_KEY=${LLM_EMBEDDING_KEY}
+      - LLM_API_KEY=${LLM_KEY}
+      - AGENTIC_DEV_MODES=memory-server
+    volumes:
+      - ./memory-config.yaml:/etc/agentic/memory-config/memory-config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8081/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  memory-oe:
+    image: ghcr.io/mongodb/agent-engine-client-libraries/orchestration-engine:0.11.8
+    restart: unless-stopped
+    ports:
+      # Published so a host-run Pensive (uvicorn main:app) can reach it at
+      # http://localhost:8010.
+      - "127.0.0.1:8010:8000"
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - ORG_ID=${PENSIVE_ORG_ID:-000000000000000000000001}
+      - PROJECT_ID=${PENSIVE_PROJECT_ID:-70656e736976650000000001}
+      - MEMORY_SERVER_URL=http://memory-server:8081
+      - OE_HTTP_PORT=8000
+      - OE_GRPC_PORT=50051
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      memory-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

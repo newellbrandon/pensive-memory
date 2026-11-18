@@ -39,9 +39,11 @@ class Config:
 
     # Atlas Agent Engine memory (agent-engine-sdk-memory). Pensive's long-term
     # memory IS the Agent Engine memory service; the SDK reaches it either on
-    # the hosted platform (project id + service-account token) or a local dev
-    # stack's orchestration engine (base URL only). With none set, Pensive runs
-    # without long-term memory instead of failing every turn.
+    # the hosted platform (project id + service-account token) or a memory
+    # backend you run yourself (base URL). docker-compose runs that backend
+    # (memory-server + memory-oe) against Pensive's own MongoDB, so the base
+    # URL defaults to the in-compose orchestration engine. With none set,
+    # Pensive runs without long-term memory instead of failing every turn.
     AGENTIC_MEMORY_BASE_URL: str = os.getenv("AGENTIC_MEMORY_BASE_URL", "")
     AGENTIC_MEMORY_PROJECT_ID: str = os.getenv("AGENTIC_MEMORY_PROJECT_ID", "")
     AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN: str = os.getenv(

@@ -241,18 +241,20 @@ Because extraction is asynchronous, a fact learned in one conversation appears a
 little later than the turn that taught it — recent turns are covered by the
 harness transcript in the meantime.
 
-### Configuration
+### Where memory is stored
 
-Point the SDK at a backend with `AGENTIC_MEMORY_*` (see `env.example`):
+`docker compose` runs the Agent Engine memory service itself — `memory-server`
+plus the `memory-oe` proxy — against **Pensive's own MongoDB** (`MONGODB_URI`),
+so there is a single database instance. The server keeps its collections
+(`memory_semantic`, `memory_episodic`, `memory_taxonomic`, `memory_procedural`,
+`memory_short_term`, …) in the `pensive_memory` database and provisions its own
+Vector Search indexes on startup. Pensive reaches it at `http://memory-oe:8000`
+(the compose default); a host-run Pensive can use `http://localhost:8010`.
 
-- **Local dev** (`agentengine dev up`): `AGENTIC_MEMORY_BASE_URL` only — e.g.
-  `http://localhost:56423` on the host, or `http://host.docker.internal:56423`
-  from the container (the compose default).
-- **Hosted platform**: `AGENTIC_MEMORY_PROJECT_ID` +
-  `AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN`.
-
-With none set — or when the backend is unreachable — memory degrades to a no-op:
-a chat turn never fails because memory is down.
+To use the hosted platform instead, set `AGENTIC_MEMORY_PROJECT_ID` +
+`AGENTIC_MEMORY_SERVICE_ACCOUNT_TOKEN` (see `env.example`). With no backend — or
+when it is unreachable — memory degrades to a no-op: a chat turn never fails
+because memory is down.
 
 ### Console
 
@@ -416,7 +418,7 @@ docker compose up -d --build
 curl http://localhost:8000/health
 ```
 
-Stop with `docker compose down`. Long-term memory lives in the Agent Engine memory service, not MongoDB, so there is no vector index to create for it (document embeddings keep their own `document_chunks` index).
+Stop with `docker compose down`. Long-term memory is stored by the memory service in Pensive's MongoDB (database `pensive_memory`); it provisions its own Vector Search indexes on startup, so there is nothing to create by hand (document embeddings keep their own `document_chunks` index).
 
 ## OpenWebUI Configuration
 
@@ -474,7 +476,7 @@ A single Session 1 message on a fresh database produces:
 | `checkpoints`       | 6         | Thread-scoped graph state snapshots (~1 per superstep) |
 | `checkpoint_writes` | 18        | State-channel writes across those steps                |
 
-(Long-term facts live in the Agent Engine memory service, not in MongoDB.)
+(Long-term facts live in the `pensive_memory` database on the same MongoDB, written by the memory service.)
 
 
 LangGraph persists checkpoint state at each graph superstep, not just the four workflow nodes visible in OpenWebUI — so **6 checkpoints and ~18 writes per message is expected**, not a leak.
@@ -525,7 +527,8 @@ curl -N http://localhost:8000/v1/chat/completions \
 ```
 pensive/
 ├── Dockerfile              # container image (+ pytest for the agent lab)
-├── docker-compose.yml      # mounts agent-workspaces/, ~/projects (ro), glean token cache
+├── docker-compose.yml      # pensive-api + memory-server + memory-oe, all on MONGODB_URI
+├── memory-config.yaml      # Agent Engine memory server config (voyage + extraction LLM)
 ├── main.py                 # uvicorn entry
 ├── config.py               # environment configuration
 ├── agent/
