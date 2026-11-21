@@ -263,6 +263,72 @@ class FakeListClient:
         return FakeResponse(self.entries_by_kind.get(kind, []))
 
 
+class DeleteClient:
+    """Stands in for the SDK's httpx.Client (delete endpoints)."""
+
+    def __init__(self, fail_ids=()):
+        self.fail_ids = set(fail_ids)
+        self.calls = []
+
+    def delete(self, url, params=None):
+        self.calls.append((url, params))
+        if url.rsplit("/", 1)[-1] in self.fail_ids:
+            raise RuntimeError("404 not found")
+        return FakeResponse([])
+
+
+class DeleteMemoriesTest(unittest.TestCase):
+    """Deleting: the SDK has no delete, so the adapter calls the service's
+    per-type delete route through the SDK's own transport."""
+
+    def setUp(self):
+        ae.reset()
+        self.addCleanup(ae.reset)
+
+    def _install(self, client):
+        memory = FakeMemory(FakeHandle(), list_client=client) if client else None
+        patcher = mock.patch.object(ae, "get_memory", lambda: memory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_routes_each_item_to_its_type(self):
+        client = DeleteClient()
+        self._install(client)
+        result = ae.delete_memories("u1", [
+            {"type": "semantic", "id": "s1"},
+            {"type": "episodic", "id": "e1"},
+            {"type": "taxonomic", "id": "t1"},
+            {"type": "procedural", "id": "p1"},
+        ])
+        self.assertEqual(result, {"deleted": 4, "failed": 0})
+        self.assertEqual([u for u, _ in client.calls], [
+            "/api/v1/memory/semantic/s1",
+            "/api/v1/memory/episodic/e1",
+            "/api/v1/memory/taxonomic/t1",
+            "/api/v1/memory/procedural/p1",
+        ])
+        self.assertEqual(client.calls[0][1], {"user_id": "u1"})
+
+    def test_counts_failures_and_skips_invalid_items(self):
+        client = DeleteClient(fail_ids={"bad"})
+        self._install(client)
+        result = ae.delete_memories("u1", [
+            {"type": "semantic", "id": "ok"},
+            {"type": "semantic", "id": "bad"},
+            {"type": "bogus", "id": "x"},
+            {"type": "semantic", "id": ""},
+        ])
+        self.assertEqual(result, {"deleted": 1, "failed": 3})
+        self.assertEqual(len(client.calls), 2)
+
+    def test_unconfigured_deletes_nothing(self):
+        self._install(None)
+        self.assertEqual(
+            ae.delete_memories("u1", [{"type": "semantic", "id": "s1"}]),
+            {"deleted": 0, "failed": 1},
+        )
+
+
 class ListMemoriesTest(unittest.TestCase):
     """Browsing: the SDK has no public list for these types, so the adapter
     reads the service's list route through the SDK's own transport."""

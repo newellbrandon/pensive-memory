@@ -333,6 +333,39 @@ def list_memories(user_id: str, mem_type: str | None = None) -> list[dict]:
     return hits
 
 
+def delete_memories(user_id: str, items: Sequence[dict]) -> dict:
+    """Delete memories by ``{"type", "id"}``. Returns deleted/failed counts.
+
+    The SDK has no delete, so this calls the service's per-type delete route
+    through the SDK's own transport (as ``list_memories`` does).
+    """
+    items = list(items or [])
+    memory = get_memory() if str(user_id or "").strip() else None
+    client, prefix = _list_transport(memory) if memory is not None else (None, None)
+    if client is None:
+        return {"deleted": 0, "failed": len(items)}
+    deleted = failed = 0
+    for item in items:
+        kind = str(item.get("type") or "")
+        memory_id = str(item.get("id") or "").strip()
+        if kind not in LONG_TERM_SOURCES or not memory_id:
+            failed += 1
+            continue
+        try:
+            response = client.delete(
+                f"{prefix}/{kind}/{memory_id}", params={"user_id": str(user_id)}
+            )
+            response.raise_for_status()
+            deleted += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            logger.warning(
+                "Memory delete failed for %s/%s (%s: %s)",
+                kind, memory_id, type(exc).__name__, exc,
+            )
+    return {"deleted": deleted, "failed": failed}
+
+
 def save_semantic(
     user_id: str, label: str, text: str, *, visibility: str = "private"
 ) -> Optional[dict]:

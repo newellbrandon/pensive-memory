@@ -208,6 +208,36 @@ class MemoryCurationTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 admin.update_memory("u1", "semantic", "name", "x")
 
+    def test_delete_memories_deletes_then_saves_note(self):
+        items = [{"type": "episodic", "id": "e1"}, {"type": "semantic", "id": "s1"}]
+        order = []
+        with mock.patch.object(
+            admin.agent_engine, "delete_memories",
+            side_effect=lambda *a: order.append("delete") or {"deleted": 2, "failed": 0},
+        ) as delete, mock.patch.object(
+            admin.agent_engine, "save_semantic",
+            side_effect=lambda *a: order.append("note") or {"id": "n1", "label": a[1], "content": a[2]},
+        ) as save:
+            result = admin.delete_memories("u1", items, note="Theory X proved useless.")
+        self.assertEqual(order, ["delete", "note"])
+        self.assertEqual(delete.call_args.args, ("u1", items))
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(result["note"]["content"], "Theory X proved useless.")
+        label = save.call_args.args[1]
+        self.assertTrue(label.startswith("note-"))
+
+    def test_delete_memories_without_note_saves_nothing(self):
+        with mock.patch.object(
+            admin.agent_engine, "delete_memories", return_value={"deleted": 1, "failed": 0}
+        ), mock.patch.object(admin.agent_engine, "save_semantic") as save:
+            result = admin.delete_memories("u1", [{"type": "semantic", "id": "s1"}], note="  ")
+        save.assert_not_called()
+        self.assertIsNone(result["note"])
+
+    def test_delete_memories_rejects_empty_selection(self):
+        with self.assertRaises(ValueError):
+            admin.delete_memories("u1", [])
+
 
 class AgentRegistryTest(unittest.TestCase):
     def setUp(self):
@@ -1235,6 +1265,26 @@ def test_update_memory_endpoint_maps_errors(monkeypatch):
     monkeypatch.setattr(admin, "update_memory", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("memory service unavailable")))
     down = _client.put("/api/admin/memories/semantic/name", json={"content": "x"})
     assert down.status_code == 503
+
+
+def test_delete_memories_endpoint(monkeypatch):
+    seen = {}
+
+    def _delete(user_id, items, note=""):
+        seen.update(user_id=user_id, items=items, note=note)
+        return {"deleted": len(items), "failed": 0, "note": None}
+
+    monkeypatch.setattr(admin, "delete_memories", _delete)
+    ok = _client.post("/api/admin/memories/delete", json={
+        "user_id": "u1", "items": [{"type": "semantic", "id": "s1"}], "note": "n",
+    })
+    assert ok.status_code == 200
+    assert ok.json()["deleted"] == 1
+    assert seen == {"user_id": "u1", "items": [{"type": "semantic", "id": "s1"}], "note": "n"}
+
+    monkeypatch.setattr(admin, "delete_memories", lambda *a, **k: (_ for _ in ()).throw(ValueError("nothing selected")))
+    bad = _client.post("/api/admin/memories/delete", json={"items": []})
+    assert bad.status_code == 400
 
 
 def test_system_prompt_roundtrip(monkeypatch):

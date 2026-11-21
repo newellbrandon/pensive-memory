@@ -30,6 +30,12 @@ class MemoryUpdateRequest(BaseModel):
     content: str
 
 
+class MemoryDeleteRequest(BaseModel):
+    user_id: str = "default"
+    items: list[dict] = []
+    note: str = ""
+
+
 class SystemPromptRequest(BaseModel):
     text: str = ""
 
@@ -91,6 +97,15 @@ async def update_memory(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"memory": record}
+
+
+@router.post("/memories/delete")
+async def delete_memories(body: MemoryDeleteRequest) -> dict:
+    """Delete one or many memories, optionally leaving a summary note."""
+    try:
+        return admin.delete_memories(body.user_id, body.items, note=body.note)
+    except ValueError as exc:
+        raise _bad_request(exc)
 
 
 @router.get("/system-prompt")

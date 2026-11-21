@@ -12,6 +12,8 @@ const state = {
   user_id: "default",
   mem_type: null, // null = all types
   types: [],
+  memoryRows: [],
+  selected: new Map(), // memory id -> row, for bulk delete
 };
 
 /* ---------- helpers ---------- */
@@ -173,6 +175,11 @@ function updateCounts(counts) {
 
 function renderMemories(rows) {
   const list = document.getElementById("memory-list");
+  state.memoryRows = rows;
+  state.selected = new Map();
+  document.getElementById("delete-confirm").hidden = true;
+  document.getElementById("memory-selection").hidden = !rows.length;
+  updateSelection();
   if (!rows.length) {
     list.innerHTML = `<div class="empty">No memories${state.mem_type ? ` of type ${esc(state.mem_type)}` : ""} for “${esc(state.user_id)}”${state.query ? ` matching “${esc(state.query)}”` : ""}.</div>`;
     return;
@@ -199,6 +206,7 @@ function memoryRow(row) {
 
   div.innerHTML = `
     <div class="row-head">
+      <input type="checkbox" class="row-select" aria-label="Select memory" ${row.id ? "" : "disabled"} />
       <span class="badge" style="background:${TYPE_COLORS[row.type] || "#00ed64"}22;color:${TYPE_COLORS[row.type] || "#00ed64"}">${esc(row.type)}</span>
       <span class="label" title="${esc(subtitle)}">${esc(row.label || "")}</span>
       <span class="when" title="${esc(whenTitle)}">${esc(fmtWhenShort(when))}${score}</span>
@@ -206,6 +214,14 @@ function memoryRow(row) {
     <p class="content">${esc(row.content)}</p>
     ${editable ? '<div class="row-actions"><button class="btn ghost small" data-action="edit">Edit</button></div>' : ""}
   `;
+
+  const checkbox = div.querySelector(".row-select");
+  checkbox.checked = state.selected.has(row.id);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) state.selected.set(row.id, row);
+    else state.selected.delete(row.id);
+    updateSelection();
+  });
 
   if (!editable) return div;
 
@@ -251,6 +267,79 @@ async function updateMemory(type, label, content) {
     },
   );
 }
+
+function updateSelection() {
+  const selectable = (state.memoryRows || []).filter((row) => row.id);
+  const count = state.selected ? state.selected.size : 0;
+  document.getElementById("selection-count").textContent = `${count} selected`;
+  const button = document.getElementById("delete-selected");
+  button.disabled = count === 0;
+  button.textContent = count ? `Delete selected (${count})` : "Delete selected";
+  const all = document.getElementById("select-all-memories");
+  all.checked = count > 0 && count === selectable.length;
+  all.indeterminate = count > 0 && count < selectable.length;
+}
+
+function showDeleteConfirm() {
+  const rows = [...state.selected.values()];
+  if (!rows.length) return;
+  const panel = document.getElementById("delete-confirm");
+  const items = rows
+    .map((row) => `<li><span class="badge-mini">${esc(row.type)}</span> ${esc(row.label || "")} — ${esc((row.content || "").slice(0, 120))}</li>`)
+    .join("");
+  panel.innerHTML = `
+    <h3>Delete ${rows.length} memor${rows.length === 1 ? "y" : "ies"} for “${esc(state.user_id)}”?</h3>
+    <p class="sub">This is permanent. Optionally keep the conclusion as one semantic memory.</p>
+    <ul class="delete-list">${items}</ul>
+    <label class="field">
+      <span>Leave a note (optional)</span>
+      <textarea id="delete-note" rows="2" placeholder="e.g. Theory X about cache warm-up was tested in Nov 2026 and proved useless."></textarea>
+    </label>
+    <div class="row-actions">
+      <button class="btn danger small" data-action="confirm">Delete ${rows.length}</button>
+      <button class="btn ghost small" data-action="cancel">Cancel</button>
+    </div>
+  `;
+  panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  panel.querySelector('[data-action="cancel"]').addEventListener("click", () => {
+    panel.hidden = true;
+  });
+  const confirmBtn = panel.querySelector('[data-action="confirm"]');
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    try {
+      const result = await api("/api/admin/memories/delete", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: state.user_id,
+          items: rows.map((row) => ({ type: row.type, id: row.id })),
+          note: document.getElementById("delete-note").value,
+        }),
+      });
+      const parts = [`Deleted ${result.deleted}`];
+      if (result.failed) parts.push(`${result.failed} failed`);
+      if (result.note) parts.push("note saved");
+      toast(parts.join(" · "), result.failed > 0);
+      loadMemories();
+    } catch (error) {
+      toast(error.message, true);
+      confirmBtn.disabled = false;
+    }
+  });
+}
+
+document.getElementById("select-all-memories").addEventListener("change", (event) => {
+  state.selected = new Map();
+  if (event.target.checked) {
+    for (const row of state.memoryRows || []) if (row.id) state.selected.set(row.id, row);
+  }
+  document.querySelectorAll("#memory-list .row-select").forEach((box) => {
+    if (!box.disabled) box.checked = event.target.checked;
+  });
+  updateSelection();
+});
+document.getElementById("delete-selected").addEventListener("click", showDeleteConfirm);
 
 document.getElementById("user-id").addEventListener("change", loadMemories);
 document.getElementById("memory-query").addEventListener("keydown", (event) => {

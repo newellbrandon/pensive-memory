@@ -54,6 +54,13 @@
         <button id="refresh-memories" class="btn ghost">Refresh</button>
       </div>
 
+      <div id="memory-selection" class="selection-bar" hidden>
+        <label class="select-all"><input id="select-all-memories" type="checkbox" /> Select all shown</label>
+        <span id="selection-count" class="selection-count">0 selected</span>
+        <button id="delete-selected" class="btn danger small" disabled>Delete selected</button>
+      </div>
+      <div id="delete-confirm" class="delete-confirm" hidden></div>
+
       <div id="memory-list" class="memory-list"></div>
     </section>
 

@@ -110,8 +110,8 @@ def set_system_prompt(text: str, collection: Collection | None = None) -> str:
 #
 # Memory lives in the Atlas Agent Engine memory service, so the console reads it
 # with the SDK's ranked search and edits it by re-saving a semantic fact (upsert
-# by label). There is deliberately no delete or merge: the service versions and
-# supersedes memories itself as it extracts them.
+# by label). Curators can also delete selected memories (e.g. a dead-end
+# project's details), optionally leaving a one-line conclusion behind.
 
 
 def _memory_row(hit: dict) -> dict:
@@ -172,6 +172,30 @@ def update_memory(user_id: str, mem_type: str, label: str, content: str) -> dict
         "label": record.get("label") or label,
         "content": record.get("content") or content,
     }
+
+
+def delete_memories(user_id: str, items: list[dict], note: str = "") -> dict:
+    """Delete selected memories, then optionally keep a one-line conclusion.
+
+    The note lets a curator collapse a dead-end's details into a single fact
+    ("Theory X proved useless") instead of keeping every gritty memory.
+    """
+    if not items:
+        raise ValueError("no memories selected")
+    result = agent_engine.delete_memories(user_id, items)
+    saved_note = None
+    if str(note or "").strip():
+        text = note.strip()
+        label = "note-" + hashlib.sha256(text.encode()).hexdigest()[:8]
+        record = agent_engine.save_semantic(user_id, label, text)
+        if record is not None:
+            saved_note = {
+                "id": record.get("id") or "",
+                "type": "semantic",
+                "label": record.get("label") or label,
+                "content": record.get("content") or text,
+            }
+    return {**result, "note": saved_note}
 
 
 # --- test agents -------------------------------------------------------------
