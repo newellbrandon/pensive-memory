@@ -333,68 +333,6 @@ def list_memories(user_id: str, mem_type: str | None = None) -> list[dict]:
     return hits
 
 
-def _fact_write(
-    user_id: str, fact: dict, session_id: str | None = None
-) -> tuple[str, dict] | None:
-    """Map an extracted fact to ``(sdk_kind, kwargs)``. ``None`` means skip."""
-    mem_type = str(fact.get("type") or "").strip().lower()
-    text = str(fact.get("text") or "").strip()
-    if mem_type not in SDK_METHOD or not text:
-        return None
-    label = str(fact.get("label") or "").strip() or (
-        f"memory-{hashlib.sha256(text.encode()).hexdigest()[:8]}"
-    )
-    if mem_type == "semantic":
-        return "semantic", dict(text=text, label=label, user_id=user_id)
-    if mem_type == "episodic":
-        return "episodic", dict(
-            title=label, content=text, user_id=user_id, session_id=session_id or "pensive"
-        )
-    if mem_type == "taxonomic":
-        return "taxonomic", dict(
-            domain="general", term=label, definition=text,
-            user_id=user_id, visibility="private",
-        )
-    return "procedural", dict(
-        procedure=slugify(label), description=text[:200], content=text, user_id=user_id
-    )
-
-
-def save_facts(
-    user_id: str, facts: Sequence[dict], *, session_id: str | None = None
-) -> int:
-    """Persist extracted facts through the typed SDK writes.
-
-    The service's own background extraction only runs for turns the Agent Engine
-    runtime records, so Pensive distils durable facts itself and writes them
-    here. Returns the number saved.
-    """
-    if not str(user_id or "").strip() or not facts:
-        return 0
-    memory = get_memory()
-    if memory is None:
-        return 0
-    saved = 0
-    for fact in facts:
-        plan = _fact_write(user_id, fact, session_id)
-        if plan is None:
-            continue
-        kind, kwargs = plan
-        try:
-            getattr(memory, SDK_METHOD[kind])(**kwargs)
-            saved += 1
-        except Exception as exc:  # noqa: BLE001
-            message = str(exc).lower()
-            if (
-                "already exists" in message
-                or "duplicate" in message
-                or "uniqueness constraint" in message
-            ):
-                continue  # an equivalent memory already exists
-            logger.warning("Memory save failed (%s: %s)", type(exc).__name__, exc)
-    return saved
-
-
 def save_semantic(
     user_id: str, label: str, text: str, *, visibility: str = "private"
 ) -> Optional[dict]:

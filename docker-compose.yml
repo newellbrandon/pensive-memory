@@ -119,6 +119,8 @@ services:
       # (not for turns Pensive writes straight through the memory API) — see
       # README "Known limitation".
       - MONGOMEM_CONSOLIDATION_ENABLED=true
+      # Must match memory-server, or the scanner sweeps a different database.
+      - MONGOMEM_DB_NAME=${PENSIVE_MEMORY_DB:-pensive_memory}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

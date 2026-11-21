@@ -698,32 +698,27 @@ def _parse_arguments(arguments: str) -> dict:
 
 
 async def save_memory(state: AgentState, runtime: Runtime | None = None) -> dict:
-    """Persist this turn to Agent Engine memory.
+    """Append this turn's user and assistant messages to Agent Engine memory.
 
-    The service's own background extraction only runs for turns its Agent Engine
-    runtime records, and Pensive writes turns straight through the memory API —
-    so Pensive records the turn AND distils durable facts itself, writing them
-    through the typed SDK writes (save_semantic / save_episode / …).
+    The service's consolidation pipeline promotes idle sessions to snapshots
+    and extracts durable facts from them, so Pensive runs no extraction itself.
     """
     user_id = state.get("user_id") or ""
     session_id = state.get("session_id") or ""
     query = _latest_user_message(state)
     response = state.get("response") or ""
 
-    agent_engine.record_turn(user_id, session_id, "user", query)
-    agent_engine.record_turn(user_id, session_id, "assistant", response)
-
-    facts = await memories.extract_memories(get_responses_client(), query)
-    saved = agent_engine.save_facts(user_id, facts, session_id=session_id)
+    saved = 0
+    if agent_engine.record_turn(user_id, session_id, "user", query):
+        saved += 1
+    if agent_engine.record_turn(user_id, session_id, "assistant", response):
+        saved += 1
 
     if saved:
-        reason = f"Saved {saved} durable memory item(s)."
+        reason = f"Recorded {saved} conversation turn(s)."
         decision_label = "saved"
-    elif facts:
-        reason = "Extracted facts were already stored."
-        decision_label = "skipped"
     else:
-        reason = "No durable fact to save."
+        reason = "No turn recorded (memory unavailable or empty)."
         decision_label = "skipped"
 
     _emit_decision("save_memory", decision_label, reason)
