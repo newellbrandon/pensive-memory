@@ -12,7 +12,7 @@ from langgraph.runtime import Runtime
 
 from admin import service as admin
 from admin.executor import PROJECT_TOOL_NAMES, execute_project_tool_call
-from glean.client import TOOL_PREFIX, get_glean_client
+from glean.client import LOADER_NAME, TOOL_PREFIX, get_glean_client, loader_schema
 from agent.state import AgentState
 from memory import agent_engine, memories
 from utils.llm import get_responses_client
@@ -235,7 +235,7 @@ async def generate_response(state: AgentState) -> dict:
     client = get_responses_client()
     if offer_server:
         # Warm the Glean tool snapshot (cheap: once per minute; no-op when the
-        # deployment is not connected) so glean_* schemas reach the model.
+        # deployment is not connected) so the loader knows which tools exist.
         try:
             await get_glean_client().refresh_tools_if_stale()
         except (Exception, BaseExceptionGroup):  # noqa: BLE001
@@ -301,7 +301,10 @@ async def generate_response(state: AgentState) -> dict:
             else:
                 exhausted.append(call)
         for call in handled:
-            digest = await _execute_server_call(call, state)
+            if _call_name(call) == LOADER_NAME:
+                digest = _load_glean_tools(call, tools)
+            else:
+                digest = await _execute_server_call(call, state)
             server_log.append(
                 {
                     "name": _call_name(call),
@@ -391,18 +394,45 @@ def _server_tools(client_tools: list[dict] | None, offer_server: bool) -> list[d
         name = (tool.get("function") or {}).get("name")
         if name not in defined:
             tools.append(tool)
-    # Glean tools (discovered MCP surface, prefixed glean_*) — only when the
-    # deployment is connected; failures surface as [error] results at call time.
-    for tool in get_glean_client().tool_schemas():
-        name = (tool.get("function") or {}).get("name")
-        if name and name not in defined:
-            tools.append(tool)
+    # Glean: only the small on-demand loader (the full schemas cost ~12k
+    # tokens per call); offered only when the deployment is connected.
+    loader = loader_schema(get_glean_client().tool_schemas())
+    if loader and LOADER_NAME not in defined:
+        tools.append(loader)
     return tools
+
+
+def _load_glean_tools(call: dict, tools: list[dict]) -> str:
+    """Add the requested Glean schemas to ``tools`` for the rest of the turn."""
+    try:
+        args = json.loads(call.get("arguments") or "{}")
+    except (ValueError, TypeError):
+        args = {}
+    wanted = args.get("tools") if isinstance(args, dict) else None
+    wanted = {str(n) for n in wanted} if isinstance(wanted, list) and wanted else None
+    present = {(t.get("function") or {}).get("name") for t in tools}
+    available = get_glean_client().tool_schemas()
+    loaded: list[str] = []
+    for schema in available:
+        name = (schema.get("function") or {}).get("name")
+        if not name or (wanted is not None and name not in wanted):
+            continue
+        if name not in present:
+            tools.append(schema)
+            present.add(name)
+        loaded.append(name)
+    if not loaded:
+        names = ", ".join((s.get("function") or {}).get("name", "") for s in available)
+        return f"[error] no matching Glean tools; available: {names or 'none (Glean not connected)'}"
+    _emit_decision("load_glean_tools", "ok", f"loaded {len(loaded)} Glean tool(s)")
+    return f"[ok] loaded Glean tools for this turn: {', '.join(loaded)}. Call them directly now."
 
 
 def _is_server_call(call: dict) -> bool:
     name = _call_name(call)
-    return name in SERVER_TOOL_NAMES or name.startswith(TOOL_PREFIX)
+    return (
+        name in SERVER_TOOL_NAMES or name == LOADER_NAME or name.startswith(TOOL_PREFIX)
+    )
 
 
 async def _execute_server_call(call: dict, state: AgentState) -> str:

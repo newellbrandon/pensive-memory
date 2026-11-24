@@ -25,6 +25,45 @@ TOOL_PREFIX = "glean_"
 _CALL_OUTPUT_LIMIT = 8000
 _SNAPSHOT_TTL_SECONDS = 60.0
 
+# The 21 discovered Glean schemas cost ~12k tokens per model call, so models
+# are offered only this small loader; calling it adds the chosen schemas for
+# the rest of the turn. Deliberately NOT glean_-prefixed: it is handled by
+# Pensive, never forwarded to Glean.
+LOADER_NAME = "load_glean_tools"
+
+
+def loader_schema(schemas: list[dict]) -> Optional[dict]:
+    """The on-demand loader for ``schemas``, or None when Glean has no tools."""
+    names = [
+        (s.get("function") or {}).get("name")
+        for s in schemas
+        if (s.get("function") or {}).get("name")
+    ]
+    if not names:
+        return None
+    return {
+        "type": "function",
+        "function": {
+            "name": LOADER_NAME,
+            "description": (
+                "Glean enterprise search over internal company knowledge "
+                "(documents, people, code, chat, meetings). Its tools are not "
+                "loaded yet: call this with the Glean tool names you need and "
+                "their definitions are added for the rest of this turn. Omit "
+                "`tools` to load them all."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": names},
+                    }
+                },
+            },
+        },
+    }
+
 # glean_search parameters the MODEL may use. The full Glean schema also
 # carries poisonable metadata filters (type, channel, from, cursor,
 # dynamic_search_result_filters, container_filter, updated, _user_goal) that

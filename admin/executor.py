@@ -535,7 +535,7 @@ DEFAULT_AGENT_TOOLS: list[dict] = [
         "web_search",
         "Search the PUBLIC web (DuckDuckGo) for a query. Use this only for "
         "external/public content — for internal or company knowledge, use "
-        "glean_search instead. Returns up to max_results (default 5, max 10) "
+        "Glean (load_glean_tools, then glean_search) instead. Returns up to max_results (default 5, max 10) "
         "results with title, URL, and a short snippet. Use web_extract to read "
         "the full content of a result URL.",
         {"query": {"type": "string", "description": "Web search query"},
@@ -575,7 +575,7 @@ DEFAULT_AGENT_TOOLS: list[dict] = [
         "book), embedded with contextualized chunk embeddings (voyage-context-4) "
         "so chunks carry full-document context. Ground answers in the returned "
         "chunks when the task concerns the ingested corpus (e.g. MongoDB "
-        "performance/internals). Use web_search or glean_search for anything "
+        "performance/internals). Use web_search or Glean (load_glean_tools) for anything "
         "not covered by the corpus.",
         {"query": {"type": "string", "description": "Natural-language search query"},
          "k": {"type": "integer", "description": "Number of chunks to return (default 5, max 10)"},

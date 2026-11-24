@@ -23,7 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from admin.executor import DEFAULT_AGENT_TOOLS, execute_tool_call, safe_workspace_path, workspace_root
 from documents import service as documents_service
-from glean.client import get_glean_client
+from glean.client import LOADER_NAME, get_glean_client, loader_schema
 from config import Config
 from memory import agent_engine
 from memory.memories import MEMORY_TYPES
@@ -702,21 +702,18 @@ async def run_agent(
     workspace = workspace_root(agent_id, base=workspace_base)
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Every lab-agent run carries the discovered
-    # Glean tools, so "search exclusively via Glean" tasks never fall back to
-    # the public web tools. Schemas are refreshed (~once a minute) and deduped
-    # against the agent's own tool list.
+    # Every lab-agent run can reach Glean, so "search exclusively via Glean"
+    # tasks never fall back to the public web tools — via the small on-demand
+    # loader, not every schema up front (~12k tokens per model call).
     agent_tools = list(agent.get("tools") or DEFAULT_AGENT_TOOLS)
     try:
         await get_glean_client().refresh_tools_if_stale()
     except Exception:  # noqa: BLE001 — best-effort; no credentials is fine
         logger.debug("Glean snapshot refresh skipped", exc_info=True)
     existing_names = {(t.get("function") or {}).get("name") for t in agent_tools}
-    for schema in get_glean_client().tool_schemas():
-        name = (schema.get("function") or {}).get("name")
-        if name and name not in existing_names:
-            agent_tools.append(schema)
-            existing_names.add(name)
+    loader = loader_schema(get_glean_client().tool_schemas())
+    if loader and LOADER_NAME not in existing_names:
+        agent_tools.append(loader)
 
     transcript: list = [HumanMessage(content=task)]
     decisions_all: list[dict] = []

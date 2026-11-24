@@ -107,7 +107,7 @@ class Config:
         "Never claim to have used tools, searched sources, or read "
         "documents you did not actually use. "
         "Pensive's own capabilities are exposed as native tools "
-        "(documents_search, pensive_api, project_list, glean_*). If the client "
+        "(documents_search, pensive_api, project_list, load_glean_tools for Glean). If the client "
         "offers a `subagent` tool, use it to delegate self-contained work. "
         "Never call Pensive's API over HTTP with curl or shell commands. "
         "File creation: if this chat exposes file tools (a coding harness), "

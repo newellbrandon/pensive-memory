@@ -114,13 +114,14 @@ while providing persistent memory for important context:
   (DCR + PKCE; the `MCP` scope is required by Glean) and a bind-mounted token
   cache. Run `python scripts/glean_auth.py` once — or use the console's
   **Glean** tab (Connect button, the OAuth callback rides the existing
-  `localhost:8000` port) — and the ~13 discovered Glean tools become
-  server-side tools in main chats (`glean_search`, `glean_chat`,
-  `glean_read_document`, …). The discovered tools are also appended to the
-  tool set of **every agent run — lab agents**
-  (and the `web_search` description steers to `glean_search` for internal
-  content), so "search exclusively via Glean" tasks never fall back to the
-  public web tools. Calls are permission-scoped to the signed-in
+  `localhost:8000` port) — and the discovered Glean tools (21 today:
+  `glean_search`, `glean_chat`, `glean_read_document`, …) become server-side
+  tools in main chats and lab-agent runs. They are **loaded on demand**: the
+  full schemas cost ~12k tokens per model call, so the model is offered only a
+  small `load_glean_tools` tool (~250 tokens) listing the names. Calling it adds
+  the chosen schemas for the rest of that turn (the `web_search` description
+  steers internal questions there), so "search exclusively via Glean" tasks
+  never fall back to the public web tools. Calls are permission-scoped to the signed-in
   user. **Boundaries:** this is a single-user local-dev credential — never
   ship or upload the token cache (` .glean-tokens.json`).
 - Connect any OpenAI chat/responses client to `http://<host>:8000/v1` with model

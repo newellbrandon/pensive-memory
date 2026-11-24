@@ -690,7 +690,9 @@ class AgentRunTest(unittest.TestCase):
             _run(admin.run_agent(self.agent, "Search Glean for X", graph))
         tools = graph.seen["input_state"]["tools"]
         names = [(t.get("function") or {}).get("name") for t in tools]
-        self.assertIn("glean_search", names)
+        # Lab runs get the on-demand loader, not every Glean schema up front.
+        self.assertIn("load_glean_tools", names)
+        self.assertNotIn("glean_search", names)
         self.assertTrue(fake_client.refresh_tools_if_stale.called)
 
 

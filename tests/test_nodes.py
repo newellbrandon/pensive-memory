@@ -185,15 +185,79 @@ class ServerToolLoopTest(unittest.TestCase):
         tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
         self.assertTrue(any("not configured" in m.content for m in tool_msgs))
 
-    def test_glean_tools_offered_when_connected(self):
+    def _glean(self, names=("glean_search", "glean_read_document")):
         fake = mock.Mock()
         fake.tool_schemas.return_value = [
-            {"type": "function", "function": {"name": "glean_search", "description": "d", "parameters": {"type": "object"}}}
+            {"type": "function", "function": {
+                "name": n, "description": f"{n} does things. More detail here.",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }}
+            for n in names
         ]
-        with mock.patch("agent.nodes.get_glean_client", return_value=fake):
+        fake.refresh_tools_if_stale = mock.AsyncMock()
+        fake.call_tool = mock.AsyncMock(return_value={"name": "glean_search", "output": "[ok] hit"})
+        return fake
+
+    def test_glean_schemas_not_loaded_up_front(self):
+        # Only the small loader is offered; the 21 full schemas cost ~12k tokens.
+        with mock.patch("agent.nodes.get_glean_client", return_value=self._glean()):
             result, client = self.run_node(_state(), [{"text": "ok"}])
-        self.assertIn("glean_search", self.tool_names(client))
+        names = self.tool_names(client)
+        self.assertIn("load_glean_tools", names)
+        self.assertNotIn("glean_search", names)
+        self.assertNotIn("glean_read_document", names)
+        loader = next(t for t in client.calls[0]["tools"]
+                      if (t.get("function") or {}).get("name") == "load_glean_tools")
+        enum = loader["function"]["parameters"]["properties"]["tools"]["items"]["enum"]
+        self.assertEqual(enum, ["glean_search", "glean_read_document"])
         self.assertEqual(result["response"], "ok")
+
+    def test_no_loader_when_glean_not_connected(self):
+        with mock.patch("agent.nodes.get_glean_client", return_value=self._glean(names=())):
+            _, client = self.run_node(_state(), [{"text": "ok"}])
+        self.assertNotIn("load_glean_tools", self.tool_names(client))
+
+    def test_loader_adds_requested_schemas_for_rest_of_turn(self):
+        load = {"id": "l1", "name": "load_glean_tools", "arguments": json.dumps({"tools": ["glean_search"]})}
+        search = {"id": "g1", "name": "glean_search", "arguments": json.dumps({"q": "x"})}
+        steps = [
+            {"text": "", "tool_calls": [load]},
+            {"text": "", "tool_calls": [search]},
+            {"text": "done", "tool_calls": []},
+        ]
+        fake = self._glean()
+        with mock.patch("agent.nodes.get_glean_client", return_value=fake):
+            result, client = self.run_node(_state(), steps)
+        self.assertEqual(result["response"], "done")
+        second = [(t.get("function") or {}).get("name") for t in client.calls[1]["tools"]]
+        self.assertIn("glean_search", second)
+        self.assertNotIn("glean_read_document", second)
+        tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
+        self.assertTrue(any("glean_search" in m.content and "[ok]" in m.content for m in tool_msgs))
+        self.assertEqual(fake.call_tool.await_args.args[0], "glean_search")
+        # Loading does not go to Glean itself.
+        self.assertEqual(fake.call_tool.await_count, 1)
+
+    def test_loader_without_names_loads_all(self):
+        load = {"id": "l1", "name": "load_glean_tools", "arguments": "{}"}
+        steps = [{"text": "", "tool_calls": [load]}, {"text": "done", "tool_calls": []}]
+        with mock.patch("agent.nodes.get_glean_client", return_value=self._glean()):
+            _, client = self.run_node(_state(), steps)
+        second = [(t.get("function") or {}).get("name") for t in client.calls[1]["tools"]]
+        self.assertIn("glean_search", second)
+        self.assertIn("glean_read_document", second)
+
+    def test_loader_works_in_lab_runs_without_server_flag(self):
+        fake = self._glean()
+        from glean.client import loader_schema
+        loader = loader_schema(fake.tool_schemas())
+        load = {"id": "l1", "name": "load_glean_tools", "arguments": json.dumps({"tools": ["glean_search"]})}
+        steps = [{"text": "", "tool_calls": [load]}, {"text": "done", "tool_calls": []}]
+        with mock.patch("agent.nodes.get_glean_client", return_value=fake):
+            result, client = self.run_node(_state(offer=False, tools=[loader]), steps)
+        self.assertEqual(result["response"], "done")
+        second = [(t.get("function") or {}).get("name") for t in client.calls[1]["tools"]]
+        self.assertIn("glean_search", second)
 
     def test_glean_tool_executed_and_result_fed_back(self):
         fake = mock.Mock()
