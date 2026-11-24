@@ -27,9 +27,10 @@ _SNAPSHOT_TTL_SECONDS = 60.0
 
 # The 21 discovered Glean schemas cost ~12k tokens per model call, so models
 # are offered only this small loader; calling it adds the chosen schemas for
-# the rest of the turn. Deliberately NOT glean_-prefixed: it is handled by
+# the rest of the turn (just glean_search by default). Deliberately NOT glean_-prefixed: it is handled by
 # Pensive, never forwarded to Glean.
 LOADER_NAME = "load_glean_tools"
+DEFAULT_LOADED = ("glean_search",)
 
 
 def loader_schema(schemas: list[dict]) -> Optional[dict]:
@@ -50,7 +51,8 @@ def loader_schema(schemas: list[dict]) -> Optional[dict]:
                 "(documents, people, code, chat, meetings). Its tools are not "
                 "loaded yet: call this with the Glean tool names you need and "
                 "their definitions are added for the rest of this turn. Omit "
-                "`tools` to load them all."
+                "`tools` to load just glean_search; name others (e.g. "
+                "glean_read_document) only when the task needs them."
             ),
             "parameters": {
                 "type": "object",

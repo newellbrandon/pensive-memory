@@ -238,14 +238,24 @@ class ServerToolLoopTest(unittest.TestCase):
         # Loading does not go to Glean itself.
         self.assertEqual(fake.call_tool.await_count, 1)
 
-    def test_loader_without_names_loads_all(self):
+    def test_loader_without_names_loads_search_only(self):
         load = {"id": "l1", "name": "load_glean_tools", "arguments": "{}"}
         steps = [{"text": "", "tool_calls": [load]}, {"text": "done", "tool_calls": []}]
         with mock.patch("agent.nodes.get_glean_client", return_value=self._glean()):
             _, client = self.run_node(_state(), steps)
         second = [(t.get("function") or {}).get("name") for t in client.calls[1]["tools"]]
         self.assertIn("glean_search", second)
+        self.assertNotIn("glean_read_document", second)
+
+    def test_loader_named_tools_still_load_others(self):
+        load = {"id": "l1", "name": "load_glean_tools",
+                "arguments": json.dumps({"tools": ["glean_read_document"]})}
+        steps = [{"text": "", "tool_calls": [load]}, {"text": "done", "tool_calls": []}]
+        with mock.patch("agent.nodes.get_glean_client", return_value=self._glean()):
+            _, client = self.run_node(_state(), steps)
+        second = [(t.get("function") or {}).get("name") for t in client.calls[1]["tools"]]
         self.assertIn("glean_read_document", second)
+        self.assertNotIn("glean_search", second)
 
     def test_loader_works_in_lab_runs_without_server_flag(self):
         fake = self._glean()

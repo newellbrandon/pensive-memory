@@ -12,7 +12,13 @@ from langgraph.runtime import Runtime
 
 from admin import service as admin
 from admin.executor import PROJECT_TOOL_NAMES, execute_project_tool_call
-from glean.client import LOADER_NAME, TOOL_PREFIX, get_glean_client, loader_schema
+from glean.client import (
+    DEFAULT_LOADED,
+    LOADER_NAME,
+    TOOL_PREFIX,
+    get_glean_client,
+    loader_schema,
+)
 from agent.state import AgentState
 from memory import agent_engine, memories
 from utils.llm import get_responses_client
@@ -409,13 +415,14 @@ def _load_glean_tools(call: dict, tools: list[dict]) -> str:
     except (ValueError, TypeError):
         args = {}
     wanted = args.get("tools") if isinstance(args, dict) else None
-    wanted = {str(n) for n in wanted} if isinstance(wanted, list) and wanted else None
+    # Search-only by default: the other tools cost tokens on every call.
+    wanted = {str(n) for n in wanted} if isinstance(wanted, list) and wanted else set(DEFAULT_LOADED)
     present = {(t.get("function") or {}).get("name") for t in tools}
     available = get_glean_client().tool_schemas()
     loaded: list[str] = []
     for schema in available:
         name = (schema.get("function") or {}).get("name")
-        if not name or (wanted is not None and name not in wanted):
+        if not name or name not in wanted:
             continue
         if name not in present:
             tools.append(schema)

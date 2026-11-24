@@ -29,6 +29,11 @@ class LoaderSchemaTest(unittest.TestCase):
         self.assertLess(len(json.dumps(loader)), len(json.dumps(schemas)) // 10)
         self.assertLess(len(json.dumps(loader)) // 4, 400)
 
+    def test_description_says_default_is_search_only(self):
+        loader = loader_schema([_schema("glean_search", "s")])
+        self.assertIn("glean_search", loader["function"]["description"])
+        self.assertNotIn("load them all", loader["function"]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

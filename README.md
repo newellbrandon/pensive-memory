@@ -119,7 +119,8 @@ while providing persistent memory for important context:
   tools in main chats and lab-agent runs. They are **loaded on demand**: the
   full schemas cost ~12k tokens per model call, so the model is offered only a
   small `load_glean_tools` tool (~250 tokens) listing the names. Calling it adds
-  the chosen schemas for the rest of that turn (the `web_search` description
+  `glean_search` for the rest of that turn by default — or whichever tools the
+  model names (e.g. `glean_read_document`) — (the `web_search` description
   steers internal questions there), so "search exclusively via Glean" tasks
   never fall back to the public web tools. Calls are permission-scoped to the signed-in
   user. **Boundaries:** this is a single-user local-dev credential — never
