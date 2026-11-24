@@ -28,8 +28,8 @@ class AgentState(TypedDict):
     tools: list[dict]
     tool_choice: object | None
     tool_calls: list[dict]
-    # Server-side capabilities: when true, the model may call pensive_subagent
-    # and the project browsing tools (never offered to subagents).
+    # Server-side capabilities: when true, the model may call the project
+    # browsing and Glean tools (never offered to agent-lab runs).
     offer_server_tools: bool
     # Full incoming request transcript for this turn (harness context). Kept
     # separate from `messages` so it is not re-accumulated by the checkpointer.
@@ -39,14 +39,11 @@ class AgentState(TypedDict):
     memory_needed: bool
     memory_query: str
     memory_context: list[dict]
-    # Research-classified turns (current/external/multi-source info needed)
-    # deterministically delegate to a subagent before the model answers.
-    delegate_research: bool
     # Token accounting: usage (input/output) summed across the generate
     # node's LLM round-trips. Must be declared here or LangGraph drops it
     # from the merged state and agent runs report 0 tokens.
     tokens_in: int
     tokens_out: int
-    # Server-tool executions from the generate loop (spawn/glean/project):
+    # Server-tool executions from the generate loop (glean/project):
     # surfaced so run history aggregates them into steps and call totals.
     server_tool_log: list[dict]

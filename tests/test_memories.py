@@ -3,7 +3,7 @@
 Storage and retrieval are the Agent Engine memory service now
 (``tests/test_agent_engine.py`` covers the adapter). What remains in
 ``memory/memories.py`` is per-turn intent planning: whether memory is needed,
-what to search for, and whether the turn is a research task.
+and what to search for.
 """
 from __future__ import annotations
 
@@ -41,11 +41,10 @@ class MemTypeTest(unittest.TestCase):
 
 
 class PlanTest(unittest.TestCase):
-    def test_intent_prompt_instructs_research_classification(self):
-        # The planner must recognize requests needing current/external/
-        # multi-source information as intent == "research" so the graph can
-        # delegate them deterministically.
-        self.assertIn("research", mem.INTENT_PROMPT)
+    def test_intent_prompt_does_not_route_to_subagents(self):
+        # Delegation is the harness's job; the planner only plans memory.
+        self.assertNotIn("subagent", mem.INTENT_PROMPT.lower())
+        self.assertNotIn("delegat", mem.INTENT_PROMPT.lower())
 
     def test_falls_back_to_no_memory_search_on_llm_failure(self):
         client = FakeClient(RuntimeError("boom"))

@@ -2,8 +2,8 @@
 
 Storage and retrieval are the Atlas Agent Engine memory service now (see
 ``memory/agent_engine.py``). What remains here is the one thing the service
-does not do: deciding, per turn, whether memory is relevant, what to search
-for, and whether the turn is a research task that should be delegated.
+does not do: deciding, per turn, whether memory is relevant and what to
+search for.
 """
 from __future__ import annotations
 
@@ -30,11 +30,7 @@ INTENT_PROMPT = (
     "preferences, skills, how they like things done) could improve the reply.\n"
     "Lean toward needs_memory=true for anything that can be personalized. Set it to "
     "false only for mechanical requests such as today's date or a factual web lookup.\n"
-    "Classify `intent` as \"research\" when the request asks for current, external, "
-    "multi-source, or verifiable information about the world (research questions, "
-    "deep dives, comparisons, fact-checking, how something works in the latest "
-    "release) — such turns are delegated to a research subagent. Otherwise use a "
-    "short category such as \"general\" or \"memory\".\n"
+    "Classify `intent` with a short category such as \"general\" or \"memory\".\n"
     "Write `query` as a standalone semantic search query describing the user facts "
     "that would help, not a restatement of the request.\n"
     'Return JSON only: {"intent": str, "needs_memory": bool, "query": str, "rationale": str}.'

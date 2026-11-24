@@ -451,7 +451,7 @@ function bindRunsFeed(chipsPrefix, boxId, fixedExecutor) {
       const runs = data.runs || [];
       box.innerHTML = "";
       if (!runs.length) {
-        box.innerHTML = `<div class="empty">No runs yet — ${fixedExecutor === "test" ? "run a lab agent from Test Agents." : "spawn a subagent from a chat, or run a lab agent from Test Agents."}</div>`;
+        box.innerHTML = `<div class="empty">No runs yet — ${fixedExecutor === "test" ? "run a lab agent from Test Agents." : "run a lab agent from Test Agents."}</div>`;
         return;
       }
       const header = document.createElement("div");
@@ -519,9 +519,6 @@ function recentRunItem(run) {
   const tokens = hasTokens ? fmtTokens(run.tokens_total) : "—";
   const calls = run.tool_call_count != null ? String(run.tool_call_count) : "—";
   const duration = run.duration_ms != null ? fmtDuration(run.duration_ms) : "—";
-  const promoteHtml = isSubagent && run.agent && run.agent.name && run.agent.system_prompt && Array.isArray(run.agent.tools)
-    ? `<button class="btn small" data-action="promote" data-run-id="${esc(run.run_id)}">Reuse as specialist agent</button>`
-    : "";
   const filesHtml = run.workspace
     ? `<button class="btn small" data-action="files">Show workspace files</button>`
     : "";
@@ -539,7 +536,6 @@ function recentRunItem(run) {
       ${run.answer ? `<p class="answer">${esc(run.answer)}</p>` : `<p class="decisions">(no answer text)</p>`}
       ${renderRunSteps(run)}
       <div class="run-actions">
-        ${promoteHtml}
         ${filesHtml}
       </div>
       <div class="workspace-block">
@@ -561,29 +557,6 @@ function recentRunItem(run) {
         filesList.innerHTML = `<span class="decisions">${esc(error.message)}</span>`;
       } finally {
         filesButton.disabled = false;
-      }
-    });
-  }
-
-  const promoteButton = item.querySelector('[data-action="promote"]');
-  if (promoteButton) {
-    promoteButton.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      promoteButton.disabled = true;
-      promoteButton.textContent = "Saving…";
-      try {
-        const res = await api("/api/admin/agents", {
-          method: "POST",
-          body: JSON.stringify(run.agent),
-        });
-        toast(`Agent “${res.agent.name}” created — find it under Test agents`);
-        promoteButton.textContent = "Saved ✓";
-        refreshAgentsTab();
-      } catch (error) {
-        promoteButton.disabled = false;
-        promoteButton.textContent = "Reuse as specialist agent";
-        toast(error.message, true);
       }
     });
   }

@@ -1,4 +1,4 @@
-"""Tests for generate_response's server-side pensive_subagent loop."""
+"""Tests for the agent nodes: server-tool loop, memory nodes, context window."""
 from __future__ import annotations
 
 import asyncio
@@ -61,32 +61,28 @@ class _FakeClient:
         return _Result(step.get("text", ""), step.get("tool_calls", []))
 
 
-class _FakeSubGraph:
-    """Graph the subagent runs on (driven by admin.run_agent)."""
-
-    def __init__(self, response):
-        self.response = response
-        self.invocations = []
-
-    async def astream(self, input_state, config=None, stream_mode=None):
-        self.invocations.append({"input_state": input_state, "config": config})
-        yield ("values", self.response)
+def _project_call(call_id, path="okf/index.md"):
+    return {"id": call_id, "name": "project_read", "arguments": json.dumps({"path": path})}
 
 
-class _BoomGraph:
-    async def astream(self, input_state, config=None, stream_mode=None):
-        raise RuntimeError("subgraph exploded")
+CLIENT_SUBAGENT = {
+    "type": "function",
+    "function": {
+        "name": "subagent",
+        "description": "Spawns an agent in a child session.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
 
 
-def _spawn_call(call_id, task, **extra):
-    args = {"task": task, **extra}
-    return {"id": call_id, "name": "pensive_subagent", "arguments": json.dumps(args)}
+class ServerToolLoopTest(unittest.TestCase):
+    """generate_response's server-tool loop (project browsing + Glean).
 
+    Pensive no longer spawns its own subagents: delegation belongs to the client
+    harness's ``subagent`` tool, whose calls are relayed back to the client."""
 
-class SpawnSubagentTest(unittest.TestCase):
     def setUp(self):
         self.decisions = []
-        self.recorded_runs = []
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(os.environ.pop, "PENSIVE_PROJECTS_ROOT", None)
@@ -100,22 +96,9 @@ class SpawnSubagentTest(unittest.TestCase):
         self.emit_patcher = mock.patch("agent.nodes._emit_decision", side_effect=capture)
         self.emit_patcher.start()
         self.addCleanup(self.emit_patcher.stop)
-        self.graph_patcher = mock.patch("agent.graph.active_graph")
-        self.mock_graph = self.graph_patcher.start()
-        self.addCleanup(self.graph_patcher.stop)
-        # record_run would hit the real Mongo connection on the host — stub it.
-        self.record_patcher = mock.patch(
-            "agent.nodes.admin.record_run",
-            side_effect=lambda agent_id, task, result, agent_def=None, executor=None: self.recorded_runs.append(
-                (agent_id, task, agent_def, executor)
-            ),
-        )
-        self.record_patcher.start()
-        self.addCleanup(self.record_patcher.stop)
 
-    def run_node(self, state, steps, graph=None):
+    def run_node(self, state, steps):
         self.mock_get_client.return_value = _FakeClient(steps)
-        self.mock_graph.return_value = graph
         return _run(nodes.generate_response(state)), self.mock_get_client.return_value
 
     def tool_names(self, client):
@@ -125,22 +108,55 @@ class SpawnSubagentTest(unittest.TestCase):
                 names.append((tool.get("function") or {}).get("name") or tool.get("name"))
         return names
 
-    def test_server_tool_offered_when_flag_on(self):
+    def _system_text(self, client):
+        return "\n".join(
+            str(getattr(m, "content", ""))
+            for m in client.calls[0]["messages"]
+            if isinstance(m, SystemMessage)
+        )
+
+    def _project_root(self):
+        root = Path(self.tmp.name)
+        os.environ["PENSIVE_PROJECTS_ROOT"] = str(root)
+        (root / "okf").mkdir(parents=True, exist_ok=True)
+        (root / "okf" / "index.md").write_text("# Bundle index\n\nconcept docs live here")
+        return root
+
+    def test_server_tools_offered_without_pensive_subagent(self):
         result, client = self.run_node(_state(), [{"text": "ok"}])
         names = self.tool_names(client)
-        self.assertIn("pensive_subagent", names)
         self.assertIn("project_list", names)
         self.assertIn("project_read", names)
+        self.assertNotIn("pensive_subagent", names)
         self.assertEqual(result["response"], "ok")
         self.assertEqual(result["tool_calls"], [])
 
     def test_no_server_tool_without_flag(self):
         client_tool = {"type": "function", "function": {"name": "edit", "description": "d"}}
-        result, client = self.run_node(_state(offer=False, tools=[client_tool]), [{"text": "ok"}])
+        _, client = self.run_node(_state(offer=False, tools=[client_tool]), [{"text": "ok"}])
         names = self.tool_names(client)
-        self.assertNotIn("pensive_subagent", names)
         self.assertNotIn("project_list", names)
         self.assertIn("edit", names)
+
+    def test_harness_subagent_offered_and_relayed_to_client(self):
+        call = {"id": "h1", "name": "subagent", "arguments": json.dumps({"prompt": "dig in"})}
+        result, client = self.run_node(
+            _state(tools=[CLIENT_SUBAGENT]), [{"text": "", "tool_calls": [call]}]
+        )
+        names = self.tool_names(client)
+        self.assertIn("subagent", names)
+        self.assertNotIn("pensive_subagent", names)
+        self.assertEqual(result["tool_calls"], [call])
+        # No Pensive-side delegation reminder is injected any more.
+        self.assertNotIn("pensive_subagent", self._system_text(client))
+        self.assertEqual(len(client.calls), 1)
+
+    def test_pensive_subagent_call_is_not_executed_server_side(self):
+        # A stale model asking for the removed tool is just relayed, never run.
+        call = {"id": "s1", "name": "pensive_subagent", "arguments": json.dumps({"task": "x"})}
+        result, client = self.run_node(_state(), [{"text": "", "tool_calls": [call]}])
+        self.assertEqual(result["tool_calls"], [call])
+        self.assertEqual(len(client.calls), 1)
 
     def test_client_tool_calls_still_relayed(self):
         call = {"id": "c1", "name": "read_file", "arguments": json.dumps({"path": "x.txt"})}
@@ -148,34 +164,25 @@ class SpawnSubagentTest(unittest.TestCase):
         self.assertEqual(result["tool_calls"], [call])
 
     def test_project_tool_executed_and_result_fed_back(self):
-        root = Path(self.tmp.name)
-        os.environ["PENSIVE_PROJECTS_ROOT"] = str(root)
-        (root / "okf").mkdir(parents=True)
-        (root / "okf" / "index.md").write_text("# Bundle index\n\nconcept docs live here")
-
-        call = {"id": "p1", "name": "project_read", "arguments": json.dumps({"path": "okf/index.md"})}
+        self._project_root()
         steps = [
-            {"text": "", "tool_calls": [call]},
+            {"text": "", "tool_calls": [_project_call("p1")]},
             {"text": "The bundle index says concept docs live there.", "tool_calls": []},
         ]
         result, client = self.run_node(_state(), steps)
         self.assertEqual(result["response"], "The bundle index says concept docs live there.")
         self.assertEqual(result["tool_calls"], [])
-        second = client.calls[1]["messages"]
-        tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
-        self.assertTrue(any("Bundle index" in m.content for m in tool_msgs))
+        tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
         self.assertTrue(any("concept docs live here" in m.content for m in tool_msgs))
 
     def test_project_tool_disabled_when_root_unset_returns_error(self):
-        call = {"id": "p1", "name": "project_read", "arguments": json.dumps({"path": "okf/index.md"})}
         steps = [
-            {"text": "", "tool_calls": [call]},
+            {"text": "", "tool_calls": [_project_call("p1")]},
             {"text": "not available", "tool_calls": []},
         ]
         result, client = self.run_node(_state(), steps)
         self.assertEqual(result["response"], "not available")
-        second = client.calls[1]["messages"]
-        tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
+        tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
         self.assertTrue(any("not configured" in m.content for m in tool_msgs))
 
     def test_glean_tools_offered_when_connected(self):
@@ -185,9 +192,7 @@ class SpawnSubagentTest(unittest.TestCase):
         ]
         with mock.patch("agent.nodes.get_glean_client", return_value=fake):
             result, client = self.run_node(_state(), [{"text": "ok"}])
-        names = self.tool_names(client)
-        self.assertIn("glean_search", names)
-        self.assertIn("pensive_subagent", names)
+        self.assertIn("glean_search", self.tool_names(client))
         self.assertEqual(result["response"], "ok")
 
     def test_glean_tool_executed_and_result_fed_back(self):
@@ -198,21 +203,17 @@ class SpawnSubagentTest(unittest.TestCase):
             return_value={"name": "glean_search", "output": "[ok] glean search returned:\nhit: doc1"}
         )
         call = {"id": "g1", "name": "glean_search", "arguments": json.dumps({"query": "deep learning"})}
-        steps = [
-            {"text": "", "tool_calls": [call]},
-            {"text": "found doc1", "tool_calls": []},
-        ]
+        steps = [{"text": "", "tool_calls": [call]}, {"text": "found doc1", "tool_calls": []}]
         with mock.patch("agent.nodes.get_glean_client", return_value=fake):
             result, client = self.run_node(_state(), steps)
         self.assertEqual(result["response"], "found doc1")
         self.assertEqual(fake.call_tool.await_args.args[0], "glean_search")
-        second = client.calls[1]["messages"]
-        tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
+        tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
         self.assertTrue(any("hit: doc1" in m.content for m in tool_msgs))
 
     def test_glean_tool_executed_even_without_server_flag(self):
-        # Subagents/agent-lab runs have offer_server_tools=False but must still
-        # be able to use Glean when the tool is in their (default) tool list.
+        # Agent-lab runs have offer_server_tools=False but must still be able
+        # to use Glean when the tool is in their (default) tool list.
         fake = mock.Mock()
         fake.tool_schemas.return_value = []
         fake.refresh_tools_if_stale = mock.AsyncMock()
@@ -224,37 +225,26 @@ class SpawnSubagentTest(unittest.TestCase):
             "function": {"name": "glean_search", "description": "d", "parameters": {"type": "object"}},
         }
         call = {"id": "g1", "name": "glean_search", "arguments": json.dumps({"query": "x"})}
-        steps = [
-            {"text": "", "tool_calls": [call]},
-            {"text": "internal hit it is", "tool_calls": []},
-        ]
+        steps = [{"text": "", "tool_calls": [call]}, {"text": "internal hit it is", "tool_calls": []}]
         with mock.patch("agent.nodes.get_glean_client", return_value=fake):
             result, client = self.run_node(_state(offer=False, tools=[glean_tool]), steps)
         self.assertEqual(result["response"], "internal hit it is")
-        self.assertEqual(fake.call_tool.await_args.args[0], "glean_search")
-        second = client.calls[1]["messages"]
-        tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
+        tool_msgs = [m for m in client.calls[1]["messages"] if isinstance(m, ToolMessage)]
         self.assertTrue(any("internal hit" in m.content for m in tool_msgs))
 
     def test_generate_logs_executed_server_calls(self):
-        # server-tool executions (spawn/glean/project) happen inside the
-        # generate loop; they must surface in the run history as tool calls
-        graph = _FakeSubGraph({"response": "digest ok", "tool_calls": [], "decisions": []})
-        steps = [
-            {"text": "", "tool_calls": [_spawn_call("s1", "research x")]},
-            {"text": "done", "tool_calls": []},
-        ]
-        result, client = self.run_node(_state(), steps, graph=graph)
+        self._project_root()
+        steps = [{"text": "", "tool_calls": [_project_call("p1")]}, {"text": "done", "tool_calls": []}]
+        result, _ = self.run_node(_state(), steps)
         log = result.get("server_tool_log") or []
         self.assertEqual(len(log), 1)
-        self.assertEqual(log[0]["name"], "pensive_subagent")
-        self.assertIn("[ok] subagent", log[0]["output"])
+        self.assertEqual(log[0]["name"], "project_read")
         self.assertIn("arguments", log[0])
 
     def test_generate_loop_accumulates_usage_tokens(self):
-        graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
+        self._project_root()
         steps = [
-            {"text": "", "tool_calls": [_spawn_call("s1", "t1")], "tokens_in": 110, "tokens_out": 22},
+            {"text": "", "tool_calls": [_project_call("p1")], "tokens_in": 110, "tokens_out": 22},
             {"text": "done", "tool_calls": [], "tokens_in": 330, "tokens_out": 44},
         ]
 
@@ -270,227 +260,56 @@ class SpawnSubagentTest(unittest.TestCase):
                 )
 
         self.mock_get_client.return_value = _TokenClient(steps)
-        self.mock_graph.return_value = graph
         result = _run(nodes.generate_response(_state()))
         self.assertEqual(result["tokens_in"], 440)
         self.assertEqual(result["tokens_out"], 66)
 
-    def test_spawn_executes_isolated_subagent_and_returns_digest(self):
-        graph = _FakeSubGraph({"response": "research digest: HNSW is the index", "tool_calls": [], "decisions": []})
-        steps = [
-            {"text": "", "tool_calls": [_spawn_call("s1", "research vector search")]},
-            {"text": "Here is the summary of the research.", "tool_calls": []},
-        ]
-        result, client = self.run_node(_state(), steps, graph=graph)
-        self.assertEqual(result["response"], "Here is the summary of the research.")
-        self.assertEqual(result["tool_calls"], [])
-
-        # subagent ran in complete isolation: agent:sub-* memory scope + thread
-        inv = graph.invocations[0]["input_state"]
-        self.assertTrue(inv["user_id"].startswith("agent:sub-"))
-        thread = graph.invocations[0]["config"]["configurable"]["thread_id"]
-        self.assertTrue(thread.startswith("agent:sub-"), thread)
-        # subagents never see the spawn tool (no nesting)
-        self.assertFalse(inv["offer_server_tools"])
-        self.assertEqual(inv["tools"], admin.DEFAULT_AGENT_TOOLS)
-
-        # digest was fed back to the main model as a ToolMessage
-        second = client.calls[1]["messages"]
-        tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
-        self.assertTrue(any("[ok] subagent" in m.content for m in tool_msgs))
-        self.assertTrue(any("HNSW is the index" in m.content for m in tool_msgs))
-        # decision streamed for the UI
-        self.assertTrue(any(d[0] == "pensive_subagent" and d[1] == "ok" for d in self.decisions))
-        # run history recorded under the ephemeral subagent id
-        self.assertEqual(len(self.recorded_runs), 1)
-        self.assertTrue(self.recorded_runs[0][0].startswith("sub-"))
-        self.assertEqual(self.recorded_runs[0][1], "research vector search")
-        # ... and the subagent definition is recorded with the run, so a good
-        # subagent can later be promoted to a reusable specialist agent
-        agent_def = self.recorded_runs[0][2]
-        self.assertEqual(set(agent_def.keys()), {"name", "system_prompt", "tools"})
-        self.assertTrue(agent_def["name"])
-        self.assertTrue(agent_def["system_prompt"])
-        self.assertEqual(agent_def["tools"], admin.DEFAULT_AGENT_TOOLS)
-        # ... tagged as a "pensive"-executed workflow (vs "test" console runs)
-        self.assertEqual(self.recorded_runs[0][3], "pensive")
-
-    def test_spawn_budget_caps_at_two(self):
-        graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        steps = [
-            {"text": "", "tool_calls": [_spawn_call("s1", "t1")]},
-            {"text": "", "tool_calls": [_spawn_call("s2", "t2")]},
-            {"text": "", "tool_calls": [_spawn_call("s3", "t3")]},
-            {"text": "all delegated", "tool_calls": []},
-        ]
-        result, client = self.run_node(_state(), steps, graph=graph)
-        self.assertEqual(result["response"], "all delegated")
-        self.assertEqual(len(client.calls), 4)
-        self.assertEqual(len(graph.invocations), 2)  # only two spawns executed
-        fourth = client.calls[3]["messages"]
-        err = [m for m in fourth if isinstance(m, ToolMessage) and "budget exhausted" in m.content]
+    def test_server_tool_budget_caps_at_eight(self):
+        self._project_root()
+        steps = [{"text": "", "tool_calls": [_project_call(f"p{i}")]} for i in range(9)]
+        steps.append({"text": "enough", "tool_calls": []})
+        result, client = self.run_node(_state(), steps)
+        self.assertEqual(result["response"], "enough")
+        last = client.calls[-1]["messages"]
+        err = [m for m in last if isinstance(m, ToolMessage) and "budget exhausted" in m.content]
         self.assertTrue(err)
+        self.assertNotIn("pensive_subagent", err[0].content)
         self.assertTrue(any(d[0] == "server_tools" and d[1] == "skipped" for d in self.decisions))
 
-    def test_missing_task_returns_error_result(self):
-        graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        call = {"id": "s1", "name": "pensive_subagent", "arguments": "{}"}
-        steps = [{"text": "", "tool_calls": [call]}, {"text": "done"}]
-        result, client = self.run_node(_state(), steps, graph=graph)
-        self.assertEqual(result["response"], "done")
-        self.assertEqual(len(graph.invocations), 0)
-        second = client.calls[1]["messages"]
-        err = [m for m in second if isinstance(m, ToolMessage) and "task" in m.content]
-        self.assertTrue(err)
 
-    def test_spawn_failure_becomes_error_result(self):
-        steps = [
-            {"text": "", "tool_calls": [_spawn_call("s1", "t")]},
-            {"text": "recovered here", "tool_calls": []},
-        ]
-        result, client = self.run_node(_state(), steps, graph=_BoomGraph())
-        self.assertEqual(result["response"], "recovered here")
-        second = client.calls[1]["messages"]
-        err = [m for m in second if isinstance(m, ToolMessage) and "subagent run failed" in m.content]
-        self.assertTrue(err)
+class SubagentRemovalTest(unittest.TestCase):
+    """Pensive's own subagents are gone; the harness's subagent tool is used."""
 
-class SpawnToolDefinitionTest(unittest.TestCase):
-    def test_spawn_description_guides_research_delegation(self):
-        # The model must recognize open-ended research as a delegation case:
-        # research tasks need pensive_subagent, not a memory-only answer.
-        description = nodes.SPAWN_SUBAGENT_TOOL["function"]["description"].lower()
-        self.assertIn("research", description)
-        self.assertIn("open-ended", description)
+    def test_nodes_exposes_no_subagent_machinery(self):
+        for name in (
+            "SPAWN_SUBAGENT_NAME", "SPAWN_SUBAGENT_TOOL", "SPAWN_DEFAULT_PROMPT",
+            "CLIENT_SUBAGENT_TOOL", "_subagent_disambiguation", "_execute_spawn",
+        ):
+            self.assertFalse(hasattr(nodes, name), name)
+        self.assertNotIn("pensive_subagent", nodes.SERVER_TOOL_NAMES)
 
-    def test_tool_name_is_namespaced_for_pensive(self):
-        # The tool must NOT be called "subagent": a coding harness (e.g. OpenCode)
-        # offers its own `subagent` tool, and the exact-name clash made the model
-        # delegate to the harness instead of Pensive.
-        self.assertEqual(nodes.SPAWN_SUBAGENT_NAME, "pensive_subagent")
-        self.assertEqual(
-            nodes.SPAWN_SUBAGENT_TOOL["function"]["name"], "pensive_subagent"
-        )
+    def test_graph_has_no_subagent_registry(self):
+        from agent import graph
+        self.assertFalse(hasattr(graph, "active_graph"))
+        self.assertFalse(hasattr(graph, "set_active_graph"))
 
-    def test_description_disambiguates_from_client_subagent(self):
-        description = nodes.SPAWN_SUBAGENT_TOOL["function"]["description"].lower()
-        # It names the harness tool and says this one is Pensive's own.
-        self.assertIn("subagent", description)
-        self.assertIn("pensive", description)
-
-
-class SubagentDisambiguationTest(SpawnSubagentTest):
-    """When the client harness offers its own `subagent` tool, Pensive adds a
-    one-line system reminder so the model delegates inside Pensive."""
-
-    CLIENT_SUBAGENT = {
-        "type": "function",
-        "function": {
-            "name": "subagent",
-            "description": "Spawns an agent in a child session.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
-
-    def _system_text(self, client):
-        messages = client.calls[0]["messages"]
-        return "\n".join(
-            str(getattr(m, "content", ""))
-            for m in messages
-            if isinstance(m, SystemMessage)
-        )
-
-    def test_disambiguation_added_when_client_offers_subagent(self):
-        _, client = self.run_node(
-            _state(tools=[self.CLIENT_SUBAGENT]), [{"text": "ok"}]
-        )
-        text = self._system_text(client)
-        self.assertIn("pensive_subagent", text)
-        self.assertIn("subagent", text)
-        # Pensive's own tool is still offered alongside the client's.
-        self.assertIn("pensive_subagent", self.tool_names(client))
-        self.assertIn("subagent", self.tool_names(client))
-
-    def test_no_disambiguation_without_client_subagent(self):
-        _, client = self.run_node(_state(tools=[]), [{"text": "ok"}])
-        self.assertNotIn("pensive_subagent", self._system_text(client))
-
-
-class ResearchDelegationTest(SpawnSubagentTest):
-    """Research-classified turns must deterministically delegate to a subagent
-    before the model answers — the digest grounds the final response."""
-
-    def _plan(self, intent: str, needs_memory: bool = False) -> MemoryPlan:
-        return MemoryPlan(
-            intent=intent,
-            needs_memory=needs_memory,
-            query="research query",
-            rationale="rationale",
-        )
-
-    def test_research_intent_sets_delegate_flag(self):
+    def test_analyze_intent_never_delegates(self):
+        plan = MemoryPlan(intent="research", needs_memory=False, query="q", rationale="r")
         with mock.patch(
-            "agent.nodes.memories.plan_memory_query",
-            new=mock.AsyncMock(return_value=self._plan("research")),
+            "agent.nodes.memories.plan_memory_query", new=mock.AsyncMock(return_value=plan)
+        ), mock.patch("agent.nodes.get_responses_client"), mock.patch(
+            "agent.nodes._emit_decision"
         ):
             result = _run(nodes.analyze_intent(_state()))
-        self.assertTrue(result.get("delegate_research"))
-        self.assertEqual(result["intent"], "research")
+        self.assertNotIn("delegate_research", result)
 
-    def test_non_research_intent_does_not_delegate(self):
-        with mock.patch(
-            "agent.nodes.memories.plan_memory_query",
-            new=mock.AsyncMock(return_value=self._plan("general")),
-        ):
-            result = _run(nodes.analyze_intent(_state()))
-        self.assertFalse(result.get("delegate_research"))
-        self.assertEqual(result["intent"], "general")
-
-    def test_research_turn_auto_spawns_before_generating(self):
-        state = _state()
-        state["delegate_research"] = True
-        graph = _FakeSubGraph(
-            {"response": "subagent research output", "tool_calls": [], "decisions": []}
-        )
-        result, client = self.run_node(
-            state, [{"text": "Answer grounded in research"}], graph=graph
-        )
-
-        # One auto-spawn executed and recorded as a pensive subagent run.
-        self.assertEqual(len(graph.invocations), 1)
-        self.assertEqual(len(self.recorded_runs), 1)
-        agent_id, task, _, executor = self.recorded_runs[0]
-        self.assertTrue(agent_id.startswith("sub-"))
-        self.assertEqual(task, "delegate the research")
-        self.assertEqual(executor, "pensive")
-
-        # The subagent digest is fed back BEFORE the model's first call, so
-        # the answer is grounded in actual research.
-        messages = client.calls[0]["messages"]
-        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
-        self.assertTrue(any("SUBAGENT ANSWER" in m.content for m in tool_msgs))
-        self.assertEqual(result["response"], "Answer grounded in research")
-        self.assertIn(
-            ("pensive_subagent", "ok"), [(s, d) for s, d, _ in self.decisions]
-        )
-
-    def test_no_research_flag_no_auto_spawn(self):
-        graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        result, _ = self.run_node(_state(), [{"text": "plain answer"}], graph=graph)
-        self.assertEqual(len(graph.invocations), 0)
-        self.assertEqual(self.recorded_runs, [])
-        self.assertEqual(result["response"], "plain answer")
+    def test_prompts_do_not_mention_pensive_subagents(self):
+        from config import Config
+        self.assertNotIn("pensive_subagent", Config.SYSTEM_PROMPT)
+        self.assertNotIn("subagent", memories.INTENT_PROMPT.lower())
 
 
-class SpawnPromptConvergenceTest(unittest.TestCase):
-    def test_spawn_default_prompt_pushes_convergence(self):
-        # Subagents must converge fast: few targeted searches, then answer —
-        # not exhaustive re-searching that burns tokens and time.
-        prompt = nodes.SPAWN_DEFAULT_PROMPT.lower()
-        self.assertIn("converge", prompt)
-        self.assertIn("answer directly", prompt)
-
-
-class ModelWindowTest(SpawnSubagentTest):
+class ModelWindowTest(ServerToolLoopTest):
     """The client transcript is the harness contract: it must always reach the
     model IN FULL. Windowing applies only to the server-tool exchanges the
     generate loop itself appends (windowing the transcript hid earlier turns
@@ -542,8 +361,7 @@ class ModelWindowTest(SpawnSubagentTest):
         state = _state()
         state["prompt_messages"] = transcript
         state["messages"] = [transcript[-1]]
-        graph = _FakeSubGraph({"response": "r", "tool_calls": [], "decisions": []})
-        result, client = self.run_node(state, steps, graph=graph)
+        result, client = self.run_node(state, steps)
         self.assertEqual(result["response"], "done")
         for recorded in client.calls:
             sent = recorded["messages"]

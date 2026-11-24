@@ -102,13 +102,11 @@ class SystemPromptTest(unittest.TestCase):
         coll = FakeCollection()
         self.assertEqual(admin.get_system_prompt(collection=coll), Config.SYSTEM_PROMPT)
 
-    def test_default_prompt_instructs_research_delegation(self):
-        # Open-ended research must be delegated to pensive_subagent, and the
-        # model must never claim tool/source use that didn't happen.
+    def test_default_prompt_leaves_delegation_to_the_harness(self):
+        # Pensive has no subagents of its own; the model must never claim
+        # tool/source use that didn't happen.
         prompt = Config.SYSTEM_PROMPT.lower()
-        self.assertIn("pensive_subagent", prompt)
-        self.assertIn("research", prompt)
-        self.assertIn("open-ended", prompt)
+        self.assertNotIn("pensive_subagent", prompt)
         self.assertIn("never claim", prompt)
 
     def test_set_persists_and_get_returns_override(self):
@@ -127,7 +125,7 @@ class SystemPromptTest(unittest.TestCase):
         # file: no fabricated uploads, no invented paths.
         prompt = Config.SYSTEM_PROMPT.lower()
         self.assertIn("no ability to save files", prompt)
-        self.assertIn("pensive_subagent", prompt)
+        self.assertNotIn("pensive_subagent", prompt)
 
 
 class MemoryCurationTest(unittest.TestCase):

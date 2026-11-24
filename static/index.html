@@ -83,7 +83,7 @@
     <section id="tab-agents" class="tab-panel">
       <div class="panel-head">
         <h1>Agents</h1>
-        <p class="sub">Deploy isolated test agents, review their run history, and browse every workflow — Pensive-spawned subagents included.</p>
+        <p class="sub">Deploy isolated test agents, review their run history, and browse every workflow.</p>
       </div>
 
       <nav class="seg" id="agents-views">
@@ -160,7 +160,7 @@
               </div>
             </div>
           </div>
-          <p class="hint">Every workflow, newest first by default — <em>pensive</em> runs are subagents spawned from a chat, <em>test</em> runs are lab agents started here. Sort by tokens, duration, or activity to spot low-token, high-performing agents worth promoting into reusable tools. Subagent rows offer <em>Reuse as specialist agent</em>.</p>
+          <p class="hint">Every workflow, newest first by default — <em>pensive</em> runs are past subagents (no longer spawned), <em>test</em> runs are lab agents started here. Sort by tokens, duration, or activity to spot low-token, high-performing agents worth promoting into reusable tools. Subagent rows offer <em>Reuse as specialist agent</em>.</p>
           <div id="recent-runs" class="runs-list"></div>
         </div>
       </div>
@@ -232,7 +232,7 @@
     <section id="tab-glean" class="tab-panel">
       <div class="panel-head">
         <h1>Glean (enterprise search)</h1>
-        <p class="sub">Connect Pensive to the Glean MCP server so main-chat agents and subagents can search company knowledge (<code>glean_search</code>, <code>glean_chat</code>, <code>glean_read_document</code>, …).</p>
+        <p class="sub">Connect Pensive to the Glean MCP server so main-chat agents and lab agents can search company knowledge (<code>glean_search</code>, <code>glean_chat</code>, <code>glean_read_document</code>, …).</p>
       </div>
       <div class="card">
         <div id="glean-status" class="glean-status"><p class="decisions">Loading Glean status…</p></div>

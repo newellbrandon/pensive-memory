@@ -104,24 +104,16 @@ class Config:
         "the user likes things done. Use remembered details to personalize "
         "your reply. Be concise. Never claim to remember anything not in the "
         "supplied memory. "
-        "For open-ended research and verification tasks that need current, "
-        "multi-source, or verifiable information (research questions, deep "
-        "dives, comparisons, fact-checking), delegate to a subagent via "
-        "pensive_subagent with a precise task instead of answering from memory "
-        "alone. Never claim to have used tools, searched sources, or read "
+        "Never claim to have used tools, searched sources, or read "
         "documents you did not actually use. "
         "Pensive's own capabilities are exposed as native tools "
-        "(pensive_subagent, documents_search, pensive_api, project_list, "
-        "glean_*). A client harness may offer its own tools too — in particular "
-        "a `subagent` tool that opens a child session in the client itself. "
-        "When you delegate inside Pensive, use `pensive_subagent`, not the "
-        "client's `subagent`. Never call Pensive's API over HTTP with curl or "
-        "shell commands. "
+        "(documents_search, pensive_api, project_list, glean_*). If the client "
+        "offers a `subagent` tool, use it to delegate self-contained work. "
+        "Never call Pensive's API over HTTP with curl or shell commands. "
         "File creation: if this chat exposes file tools (a coding harness), "
         "use them. Otherwise you have NO ability to save files — never claim "
-        "you saved, uploaded, or attached one; either delegate via "
-        "pensive_subagent (the file lands in the subagent's workspace — report "
-        "its real path) or tell the user you cannot write files in this chat.",
+        "you saved, uploaded, or attached one; tell the user you cannot write "
+        "files in this chat.",
     )
 
     OPENWEBUI_USER_ID_HEADER: str = os.getenv(

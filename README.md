@@ -11,7 +11,7 @@ The API is **OpenAI-compatible** so you can connect [OpenWebUI](https://docs.ope
 
 ### System overview
 
-OpenWebUI or a coding harness sends chat requests to the FastAPI layer, which invokes a compiled LangGraph workflow. MongoDB holds short-term thread state (checkpointer); long-term memory is the **Atlas Agent Engine memory service**, reached through the `agent-engine-sdk-memory` SDK. On top of the core chat loop, Pensive runs a **server-tool layer** (subagent delegation, project browsing, Glean enterprise search), an **agent lab** (isolated, runnable/rerunnable agents), a **document knowledge base** (contextualized chunk embeddings — agents ground answers in uploaded PDFs via `documents_search` on demand), and a **management console** at `/ui` — with every agent workflow recorded as sortable, metric-bearing run history.
+OpenWebUI or a coding harness sends chat requests to the FastAPI layer, which invokes a compiled LangGraph workflow. MongoDB holds short-term thread state (checkpointer); long-term memory is the **Atlas Agent Engine memory service**, reached through the `agent-engine-sdk-memory` SDK. On top of the core chat loop, Pensive runs a **server-tool layer** (project browsing, Glean enterprise search), an **agent lab** (isolated, runnable/rerunnable agents), a **document knowledge base** (contextualized chunk embeddings — agents ground answers in uploaded PDFs via `documents_search` on demand), and a **management console** at `/ui` — with every agent workflow recorded as sortable, metric-bearing run history.
 
 Pensive exposes both OpenAI-compatible protocols: **Chat Completions** (`POST /v1/chat/completions`) and the **Responses API** (`POST /v1/responses`). OpenWebUI can be pointed at either connection type.
 
@@ -23,8 +23,6 @@ flowchart TD
   lg -.->|"MongoDBSaver · every superstep"| checkpoints["checkpoints<br/>checkpoint_writes"]
   lg -->|"Memory.record_turn · Memory.build_context (SDK)"| memsvc[("Atlas Agent Engine<br/>memory service")]
 
-  lg -.->|"pensive_subagent · digest only"| sub["Isolated subagent<br/>memory agent:sub-* · own workspace"]
-  sub -->|"runs the same graph"| lg
   lg -.->|"glean_* tools · MCP + OAuth2"| glean[("Glean enterprise search")]
   lg -.->|"project_list / project_read"| projects[("~/projects · read-only")]
   lg -.->|"documents_search · on demand"| dstore[("document_chunks<br/>voyage-context-4 · 1024d")]
@@ -40,7 +38,7 @@ flowchart TD
 
 ### LangGraph workflow
 
-Every chat message — and every agent-lab/subagent run — runs the four nodes below. The graph also carries a **server-tool loop inside `generate_response`** (offered only in main-context chats): the model may delegate via `pensive_subagent`, browse host projects (`project_list` / `project_read`), or call the discovered Glean tools (`glean_*`); results are executed server-side and fed back until the model produces a final answer. OpenWebUI streams the **decision** from each step before the final answer — the second line in each node label matches what you see in the demo screenshots.
+Every chat message — and every agent-lab run — runs the four nodes below. The graph also carries a **server-tool loop inside `generate_response`** (offered only in main-context chats): the model may browse host projects (`project_list` / `project_read`), or call the discovered Glean tools (`glean_*`); results are executed server-side and fed back until the model produces a final answer. OpenWebUI streams the **decision** from each step before the final answer — the second line in each node label matches what you see in the demo screenshots.
 
 The checkpointer persists graph state after every superstep (not only these four nodes), which is why a single message produces multiple `checkpoints` and `checkpoint_writes` documents.
 
@@ -55,7 +53,7 @@ flowchart TD
   search --> generate
 
   generate -.->|"OpenAI Responses API"| llmNode[["LLM"]]
-  generate -.->|"server-tool loop: pensive_subagent · project_* · glean_*"| serverTools["server tools<br/>budgeted · results fed back"]
+  generate -.->|"server-tool loop: project_* · glean_*"| serverTools["server tools<br/>budgeted · results fed back"]
   generate --> save["save_memory<br/>Save Memory"]
 
   save -->|"Memory.record_turn (user + assistant)"| memsvc
@@ -99,17 +97,12 @@ while providing persistent memory for important context:
   durable facts in the background; each turn's prompt is grounded with
   `build_context` over those facts, so they carry across sessions, chats, and
   workflows.
-- **Subagent delegation keeps the primary context clean.** Main-context chats are
-  offered a server-side `pensive_subagent` tool: the model can delegate a
-  self-contained task (research, builds, long tool chains) to an isolated
-  subagent with its own memory scope (`agent:sub-…`), workspace, and tools. Only
-  a short digest of the subagent's final answer returns to the conversation (at
-  most 2 calls per turn, no nesting — subagents never see the delegation tool).
-  Full artifacts land in the subagent's workspace and run history. The tool is
-  named `pensive_subagent` on purpose: a coding harness (e.g. OpenCode) may offer
-  its **own** `subagent` tool, whose calls Pensive relays back to the client. When
-  a client offers one, Pensive adds a one-line system reminder so the model uses
-  `pensive_subagent` for in-Pensive delegation.
+- **Delegation belongs to the harness.** Pensive runs no subagents of its own.
+  When a coding harness (e.g. OpenCode) offers a `subagent` tool, Pensive passes
+  it to the model like any client tool and relays its calls back to the client,
+  which runs the child session. (Pensive's former `pensive_subagent` and its
+  automatic delegation of "research" turns were removed: each spawn re-ran the
+  whole graph and cost a second full tool loop per turn.)
 - **Read access to your projects (incl. the OKF bundle).** The host's
   `~/projects` directory (or `PROJECTS_HOST_DIR`) is mounted read-only into the
   container at `/projects`, and main-context chats plus all agents get
@@ -124,7 +117,7 @@ while providing persistent memory for important context:
   `localhost:8000` port) — and the ~13 discovered Glean tools become
   server-side tools in main chats (`glean_search`, `glean_chat`,
   `glean_read_document`, …). The discovered tools are also appended to the
-  tool set of **every agent run — lab agents and spawned subagents alike**
+  tool set of **every agent run — lab agents**
   (and the `web_search` description steers to `glean_search` for internal
   content), so "search exclusively via Glean" tasks never fall back to the
   public web tools. Calls are permission-scoped to the signed-in
@@ -143,7 +136,7 @@ canvas, mongo-green accents) and powers five tabs:
 | --- | --------------- |
 | **Memories** | Search a user's memory in the **Atlas Agent Engine memory service** and curate it. Pick a user and type a query — the SDK's ranked search (`Memory.search`) returns the relevant **Semantic** (user facts and preferences), **Episodic** (session events, decisions, outcomes), **Taxonomic** (domain vocabulary and reusable concepts like corporate policies), and **Procedural** (reusable workflows and agent runbooks — skills) memories with scores. **Semantic** facts are editable in place and **re-embedded automatically** on save (`Memory.save_semantic` upserts by label). Select one or many memories (or **Select all shown** after a search) and **Delete selected** — optionally leaving a one-line note, so a dead-end project's details collapse into a single conclusion. The service soft-deletes (`deleted: true`), so removed memories leave search, browse, and the prompt. |
 | **System Prompt** | View and change the assistant persona injected at the top of every main-context request. Persisted in MongoDB; leave empty to restore the built-in default. |
-| **Agents** | Deploy a **test agent** with its own system prompt and tools, then run a task in **complete isolation** — memory is scoped to `agent:<id>` so it can't pollute (or be polluted by) the main Pensive context. The tab is split into three segmented views: **Test Agents** (create form + registry; leave the name blank to **auto-generate** one like `coral-scribe-3621`, and tools empty for the built-in sandboxed set `write_file`, `append_file`, `read_file`, `run_command`, `web_search`, `web_extract`, `documents_search`), **Test Agent History** (every lab-agent run, locked to `test`, sortable), and **Agent Workflows** (every workflow incl. `pensive` subagent runs — aligned Source · Agent · When · Tokens · Tool calls · Runtime columns with clickable filter chips and sort chips). Clicking any row expands the full task, answer, step transcripts, a **Reuse as specialist agent** action, and the workspace files (assets) — a capable subagent (say, a great Glean researcher) can be promoted into a permanent, rerunnable agent with its own memory scope. **Edit any agent** (Edit button loads its name/prompt/tools back into the form), and open **Runs & artifacts** on a card to review past runs — each run shows a **step-by-step transcript** (model response, decisions, and every executed tool call with full arguments and results), a one-click **Run again** button, and a **workspace file browser** (list + content preview via `GET /agents/{id}/workspace`). |
+| **Agents** | Deploy a **test agent** with its own system prompt and tools, then run a task in **complete isolation** — memory is scoped to `agent:<id>` so it can't pollute (or be polluted by) the main Pensive context. The tab is split into three segmented views: **Test Agents** (create form + registry; leave the name blank to **auto-generate** one like `coral-scribe-3621`, and tools empty for the built-in sandboxed set `write_file`, `append_file`, `read_file`, `run_command`, `web_search`, `web_extract`, `documents_search`), **Test Agent History** (every lab-agent run, locked to `test`, sortable), and **Agent Workflows** (every workflow, incl. past `pensive` subagent runs — aligned Source · Agent · When · Tokens · Tool calls · Runtime columns with clickable filter chips and sort chips). Clicking any row expands the full task, answer, step transcripts, and the workspace files (assets). **Edit any agent** (Edit button loads its name/prompt/tools back into the form), and open **Runs & artifacts** on a card to review past runs — each run shows a **step-by-step transcript** (model response, decisions, and every executed tool call with full arguments and results), a one-click **Run again** button, and a **workspace file browser** (list + content preview via `GET /agents/{id}/workspace`). |
 | **Documents** | Build a **queryable knowledge base** from uploaded files (PDF / txt / md) using **contextualized chunk embeddings** (`voyage-context-4`) — extract text (pypdf), split into bounded segments, and embed each chunk **in the context of its full document** (server-side auto-chunking, 512-token chunks, char-budgeted batches to respect the API's per-request token cap). The library lists every document with its status (`ingesting → ready | failed`), pages, chunk count, tokens, and model — plus **Chunk preview** (text per chunk), **Re-embed** (retry a failed ingest), and **Delete** (drops chunks + the stored original). A **semantic search** box embeds the query (`input_type=query`) and returns the top-k chunks with scores, optionally restricted to one document. The **`documents_search` tool** then makes the corpus available to every agent on demand — it is never injected into prompts, so queries that don't need it pay nothing. |
 | **Glean** | Connect Pensive to the Glean MCP server (MongoDB enterprise search) with a native **OAuth2 dynamic-client flow** (DCR + PKCE; the `MCP` scope is required by Glean): status + token expiry, **Connect** (opens the authorization screen; the callback rides the existing `localhost:8000` port), **Refresh token**, **Disconnect**, and a **smoke-test box** that calls any discovered tool (`search: …` runs `glean_search`). Once connected, the ~13 discovered Glean tools are available to main chats **and every agent run** as `glean_*` server tools, permission-scoped to the signed-in user. The token cache (` .glean-tokens.json`) is gitignored and bind-mounted — a single-user dev credential, never to be shipped. |
 
@@ -219,8 +212,7 @@ The adapter (`memory/agent_engine.py`) is the only seam that talks to the
 service; everything else calls it:
 
 1. **Intent planning** (`analyze_intent`, in `memory/memories.py`) — an LLM turns
-   the latest message into a search `query`, a `needs_memory` flag, and a
-   `research` classification that drives deterministic subagent delegation.
+   the latest message into a search `query` and a `needs_memory` flag.
 2. **Context assembly** (`search_long_term_memory`) — `Memory.build_context`
    retrieves over the long-term sources (`semantic`, `episodic`, `taxonomic`,
    `procedural`), ranks and de-duplicates across them, trims to a token budget,
@@ -303,7 +295,7 @@ prompt's memory block and in the Console — so temporal reasoning still works.
 
 ### Memory pays off on repeat work (tokens, tools, runtime)
 
-Every agent run in the **Agents** tab — lab agents and chat-spawned subagents alike — is recorded in **Agent Workflows** with sortable **tokens**, **tool calls**, and **runtime**. That history makes it easy to see when scoped long-term memory (`agent:<id>`) is doing its job: later runs on the same task need less exploration, fewer tool round-trips, and finish faster because facts and procedures already live in the store instead of being rediscovered every time.
+Every lab-agent run in the **Agents** tab is recorded (past `pensive` subagent runs stay visible as read-only history) in **Agent Workflows** with sortable **tokens**, **tool calls**, and **runtime**. That history makes it easy to see when scoped long-term memory (`agent:<id>`) is doing its job: later runs on the same task need less exploration, fewer tool round-trips, and finish faster because facts and procedures already live in the store instead of being rediscovered every time.
 
 ![Agent Workflows: memory-backed runs trend toward fewer tokens, tool calls, and shorter runtime](agent_workflows_memory_efficiency.png)
 
@@ -547,7 +539,7 @@ pensive/
 ├── main.py                 # uvicorn entry
 ├── config.py               # environment configuration
 ├── agent/
-│   ├── graph.py            # LangGraph workflow (+ subagent wiring)
+│   ├── graph.py            # LangGraph workflow
 │   ├── nodes.py            # analyze_intent, search, generate (server-tool loop), save
 │   └── state.py            # AgentState schema (incl. token accounting)
 ├── admin/
@@ -555,7 +547,7 @@ pensive/
 │   └── service.py          # agent registry, run loop + metrics, memory curation, run history
 ├── memory/
 │   ├── agent_engine.py     # Atlas Agent Engine memory adapter (agent-engine-sdk-memory)
-│   └── memories.py         # per-turn intent planning (query + research classification)
+│   └── memories.py         # per-turn intent planning (memory query)
 ├── glean/
 │   ├── oauth.py            # MCP dynamic-client OAuth2 (discovery, DCR, PKCE, refresh)
 │   ├── client.py           # MCP client wrapper (one session per operation)

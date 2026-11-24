@@ -306,8 +306,8 @@ def _public_run(doc: dict) -> dict:
         "workspace": doc.get("workspace") or "",
         "status": doc.get("status") or "",
         "created_at": doc.get("created_at"),
-        # Who executed the workflow: "pensive" (subagent spawned from a main
-        # chat) or "test" (console lab-agent run). Legacy runs fall back to
+        # Who executed the workflow: "pensive" (a past chat-spawned subagent;
+        # Pensive no longer spawns them) or "test" (console lab-agent run). Legacy runs fall back to
         # the sub- agent-id prefix convention.
         "executor": doc.get("executor") or (
             "pensive" if str(doc.get("agent_id") or "").startswith("sub-") else "test"
@@ -337,9 +337,8 @@ def _public_run(doc: dict) -> dict:
             if doc.get("step_count") is not None
             else (len(doc.get("steps") or []) or None)
         ),
-        # Definition of the agent that ran (name/system prompt/tools) when it
-        # was an ephemeral subagent — lets the console promote it to a
-        # reusable specialist agent.
+        # Definition of the agent that ran (name/system prompt/tools), kept
+        # on past subagent runs for reference.
         "agent": doc.get("agent"),
     }
 
@@ -357,10 +356,9 @@ def record_run(
 
     The result is stored with bounded sizes (executed tool-call outputs are
     already truncated by the executor) so history stays light. ``agent_def``
-    captures the ephemeral agent's definition (name / system prompt / tools)
-    so a useful subagent can later be promoted to a reusable lab agent.
-    ``executor`` tags who ran it: "pensive" (spawned from a chat) or "test"
-    (console lab-agent run).
+    captures the agent's definition (name / system prompt / tools).
+    ``executor`` tags who ran it: "test" (console lab-agent run) or
+    "pensive" (legacy chat-spawned subagents).
     """
     doc = {
         "_id": uuid.uuid4().hex[:12],
@@ -643,7 +641,7 @@ async def _invoke_agent_step(
         "tool_choice": None,
         "tool_calls": [],
         "system_prompt": agent.get("system_prompt") or "",
-        # Subagents never see the spawn/spawn tool themselves — no nesting.
+        # Lab agents never get the main-chat server tools.
         "offer_server_tools": False,
     }
     config: dict = {
@@ -704,7 +702,7 @@ async def run_agent(
     workspace = workspace_root(agent_id, base=workspace_base)
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Every agent run (lab agents AND spawned subagents) carries the discovered
+    # Every lab-agent run carries the discovered
     # Glean tools, so "search exclusively via Glean" tasks never fall back to
     # the public web tools. Schemas are refreshed (~once a minute) and deduped
     # against the agent's own tool list.
